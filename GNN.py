@@ -1,0 +1,6051 @@
+"""
+**Interesting Title Here**
+Siva Subramanian Ram, Mary Institute and Saint Louis Country Day School
+
+Abstract
+--------
+Alzheimer's disease (AD) is increasingly characterized as a disorder of large-scale
+brain network disintegration rather than isolated regional dysfunction. This project
+models individual brains as time-evolving graphs derived from resting-state fMRI
+(rs-fMRI) and wires the codebase to run directly from ADNI-preprocessed ROI
+timeseries. Nodes represent anatomically defined brain regions and edges encode
+dynamic functional connectivity. Temporal evolution is modeled with continuous-time
+graph neural ODEs and attention-based interpretability is provided for node/edge
+attributions relevant to AD progression.
+
+This file contains utilities for: preprocessing ADNI ROI timeseries, constructing
+node features (ALFF, ReHo proxy, rolling activation statistics), empirical
+connectivity, a learned edge generator, and a dataset class `ADNIDataset` that
+loads ADNI-derived timeseries and clinical labels for longitudinal prediction.
+
+High-level motivation
+---------------------
+Alzheimer’s disease (AD) is increasingly characterized as a disorder of large-scale brain network disintegration rather than isolated regional dysfunction. Neuroimaging work highlights early disruption of functional connectivity (particularly within hub-dominated systems such as the Default Mode Network), followed by compensatory reorganization and progressive network collapse. Standard ML approaches that use static or Euclidean representations can miss the temporally-evolving network-driven patterns that are clinically meaningful. This project reframes AD modeling as a graph learning problem: nodes are brain regions whose features capture neurophysiological descriptors (ALFF, ReHo proxies, rolling activation statistics), while edges encode dynamic functional connectivity. To capture deteriorating connectivity and smooth longitudinal changes, we model temporal evolution via continuous-time graph neural ODEs (Neural ODE GNNs). Neural ODEs naturally accommodate irregular longitudinal sampling and missing visits by integrating graph-parameterized instantaneous dynamics over arbitrary time grids, enabling smooth subject-level latent trajectories with variable inter-scan intervals common in longitudinal neuroimaging. For interpretability we provide attention-based edge weighting and node-level attributions (PX node-feature masks, PA edge attention, gradient/IG-based saliency) so clinicians and researchers can identify disease-relevant ROIs and subnetworks and inspect subject-level trajectories.
+
+Notes on ADNI
+-------------
+This code expects ADNI-derived ROI timeseries (per-subject files) organized as
+one file per session with a manifest CSV that lists subject IDs, session dates,
+diagnosis (CN/MCI/AD), and path to the ROI timeseries file (supported formats: .npy, .npz, .mat, .csv).
+See the `README.md` for instructions on pulling ADNI data and converting to ROI timeseries.
+"""
+
+import os
+import sys
+import json
+import csv
+import math
+import random
+import warnings
+from pathlib import Path
+import numpy as np
+from typing import Optional, Union, Dict, Tuple, List
+import logging
+import argparse
+try:
+    import pandas as pd
+except Exception:
+    pd = None
+    # pandas is optional for some utilities; continue even if it's not installed
+
+import scipy.io
+# nibabel is optional; import dynamically to avoid static analyzer/reportMissingImports errors when it's not installed
+try:
+    import importlib
+    nib = importlib.import_module('nibabel')
+except Exception:
+    nib = None
+
+# Enforce core required packages at import time with clear message
+_required_missing = []
+try:
+    import torch
+except Exception:
+    _required_missing.append('torch')
+try:
+    import scipy
+except Exception:
+    if 'scipy' not in _required_missing:
+        _required_missing.append('scipy')
+if _required_missing:
+    raise ModuleNotFoundError(
+        'Missing required Python packages: ' + ', '.join(_required_missing)
+        + ". Install them (e.g. `python3 -m pip install " + ' '.join(_required_missing) + "`) before importing this module."
+    )
+# ---------------------- Neuroscience utilities (features & connectivity) ----------------------
+
+def compute_empirical_fc_from_timeseries(timeseries: np.ndarray) -> np.ndarray:
+    """Compute empirical functional connectivity (Pearson correlation) from ROI timeseries.
+
+    Args:
+        timeseries: (T, N) array of BOLD-like signals (time x regions)
+
+    Returns:
+        fc: (N, N) correlation matrix (values in [ -1, 1 ])
+    """
+    if timeseries.ndim != 2:
+        raise ValueError('timeseries must be (T, N)')
+    # Transpose to (N, T) for np.corrcoef convenience
+    fc = np.corrcoef(timeseries.T)
+    # numerical stability
+    fc = np.nan_to_num(fc)
+    # clamp to [0,1] for connectivity strength (we'll keep absolute value)
+    return np.clip(np.abs(fc), 0.0, 1.0)
+
+
+def compute_alff(timeseries: np.ndarray, fs: float = 0.5, low: float = 0.01, high: float = 0.08) -> np.ndarray:
+    """Compute ALFF (amplitude of low-frequency fluctuations) per ROI.
+
+    Args:
+        timeseries: (T, N)
+        fs: sampling frequency in Hz (typical fMRI TR=2s -> fs=0.5)
+        low, high: frequency band for ALFF
+
+    Returns:
+        alff: (N,) ALFF values normalized per subject
+    """
+    try:
+        from scipy.signal import welch
+    except Exception:
+        raise RuntimeError('scipy required for ALFF calculation')
+
+    T, N = timeseries.shape
+    alff = np.zeros(N, dtype=np.float32)
+    for i in range(N):
+        f, Pxx = welch(timeseries[:, i], fs=fs, nperseg=min(256, max(8, T//2)))
+        band_mask = (f >= low) & (f <= high)
+        alff[i] = Pxx[band_mask].sum() if band_mask.any() else 0.0
+    # normalize
+    if alff.max() > 0:
+        alff = alff / (alff.max() + 1e-9)
+    return alff
+
+
+def compute_reho_proxy(timeseries: np.ndarray, adjacency: Optional[np.ndarray] = None, k: int = 6) -> np.ndarray:
+    """Approximate ReHo by mean pairwise Spearman correlation among a node and its neighbors.
+
+    This is a pragmatic ROI-level proxy for voxel-wise Kendall W ReHo.
+
+    Args:
+        timeseries: (T, N)
+        adjacency: optional (N, N) adjacency to define neighbors; if None use correlation-based neighbors
+        k: number of neighbors to consider
+
+    Returns:
+        reho: (N,) values normalized
+    """
+    try:
+        from scipy.stats import spearmanr
+    except Exception:
+        raise RuntimeError('scipy required for ReHo proxy')
+
+    T, N = timeseries.shape
+    if adjacency is None:
+        # derive adjacency via correlation
+        adj = compute_empirical_fc_from_timeseries(timeseries)
+    else:
+        adj = np.array(adjacency, dtype=float)
+
+    reho = np.zeros(N, dtype=np.float32)
+    for i in range(N):
+        neighbors = np.argsort(-adj[i, :])[: k + 1]
+        # include self
+        if i not in neighbors:
+            neighbors = np.concatenate(([i], neighbors[:-1]))
+        # extract time series for these nodes (T, m)
+        block = timeseries[:, neighbors]
+        # compute pairwise spearman correlations and average
+        if block.shape[1] <= 1:
+            reho[i] = 0.0
+            continue
+        rho_mat = np.corrcoef(block.T)  # approximate using Pearson on ranked signals
+        reho[i] = np.nanmean(np.abs(rho_mat))
+    if reho.max() > 0:
+        reho = reho / (reho.max() + 1e-9)
+    return reho
+
+
+def node_features_from_timeseries(timeseries: np.ndarray, adjacency: Optional[np.ndarray] = None, fs: float = 0.5) -> np.ndarray:
+    """Construct node features (T, N, F) from raw ROI timeseries.
+
+    Features per node: mean activation (over short window), std, ALFF, ReHo.
+    For ALFF/ReHo we compute a subject-level value and broadcast across timepoints.
+    """
+    # timeseries: (T, N)
+    T, N = timeseries.shape
+    # mean and std per timepoint: here we compute rolling window mean/std of window length 5 (or T if small)
+    w = min(5, T)
+    means = np.zeros((T, N), dtype=np.float32)
+    stds = np.zeros((T, N), dtype=np.float32)
+    for t in range(T):
+        s = max(0, t - w + 1)
+        block = timeseries[s: t + 1]
+        means[t] = block.mean(axis=0)
+        stds[t] = block.std(axis=0)
+
+    alff = compute_alff(timeseries, fs=fs)
+    reho = compute_reho_proxy(timeseries, adjacency=adjacency)
+
+    # broadcast alff/reho across time dimension
+    alff_t = np.tile(alff.reshape(1, N), (T, 1))
+    reho_t = np.tile(reho.reshape(1, N), (T, 1))
+
+    features = np.stack([means, stds, alff_t, reho_t], axis=-1)  # (T, N, 4)
+    return features.astype(np.float32)
+
+
+def _sparsify_adj(adj: np.ndarray, top_percent: float = 0.1) -> np.ndarray:
+    """Sparsify adjacency by keeping top_percent of edges (by value) while ensuring
+    each node has at least one connection.
+    """
+    A = adj.copy()
+    N = A.shape[0]
+    if top_percent <= 0 or top_percent >= 1.0:
+        return A
+    tri_idx = np.triu_indices(N, k=1)
+    vals = A[tri_idx]
+    k = max(1, int(len(vals) * top_percent))
+    thresh = np.partition(vals.ravel(), -k)[-k]
+    mask = (A >= thresh).astype(float)
+    # ensure symmetry
+    mask = np.maximum(mask, mask.T)
+    # ensure each node has at least one edge
+    for i in range(N):
+        if mask[i].sum() == 0:
+            j = int(np.argmax(A[i]))
+            mask[i, j] = 1.0
+            mask[j, i] = 1.0
+    A = A * mask
+    # renormalize
+    if A.max() > 0:
+        A = A / (A.max() + 1e-12)
+    return A
+
+
+def compute_mutual_info_matrix(timeseries: np.ndarray, n_bins: int = 16) -> np.ndarray:
+    """Estimate pairwise mutual information by histogram discretization.
+    Returns (N,N) symmetric MI matrix.
+    """
+    T, N = timeseries.shape
+    # discretize each signal
+    hist_bins = np.linspace(np.min(timeseries), np.max(timeseries), n_bins + 1)
+    disc = np.digitize(timeseries, hist_bins) - 1
+    mi = np.zeros((N, N), dtype=np.float32)
+    for i in range(N):
+        for j in range(i, N):
+            try:
+                m = mutual_info_score(disc[:, i], disc[:, j])
+            except Exception:
+                m = 0.0
+            mi[i, j] = m
+            mi[j, i] = m
+    # normalize
+    if mi.max() > 0:
+        mi = mi / (mi.max() + 1e-12)
+    return mi
+
+
+def compute_coherence_matrix(timeseries: np.ndarray, fs: float = 0.5) -> np.ndarray:
+    """Compute pairwise coherence using scipy.signal.coherence; fallback to abs(corr).
+    """
+    T, N = timeseries.shape
+    coh = np.zeros((N, N), dtype=np.float32)
+    try:
+        for i in range(N):
+            for j in range(i, N):
+                f, Cxy = coherence(timeseries[:, i], timeseries[:, j], fs=fs, nperseg=min(256, max(8, T//2)))
+                val = np.mean(Cxy)
+                coh[i, j] = val
+                coh[j, i] = val
+    except Exception:
+        # fallback: use absolute Pearson correlation
+        coh = compute_empirical_fc_from_timeseries(timeseries)
+    if coh.max() > 0:
+        coh = coh / (coh.max() + 1e-12)
+    return coh
+
+
+def compute_multimodal_adjacency(timeseries: np.ndarray, weights: Optional[Dict[str, float]] = None, fs: float = 0.5, sparsify_pct: float = 0.1) -> np.ndarray:
+    """Combine Pearson correlation, MI, and coherence into a single adjacency.
+
+    weights: dict with keys 'pearson','mi','coh'
+    """
+    if weights is None:
+        weights = {'pearson': 0.6, 'mi': 0.2, 'coh': 0.2}
+    R = compute_empirical_fc_from_timeseries(timeseries)
+    I = compute_mutual_info_matrix(timeseries)
+    C = compute_coherence_matrix(timeseries, fs=fs)
+    A = weights.get('pearson', 0.0) * R + weights.get('mi', 0.0) * I + weights.get('coh', 0.0) * C
+    A = np.clip(A, 0.0, None)
+    A = _sparsify_adj(A, top_percent=sparsify_pct)
+    return A.astype(np.float32)
+
+
+# ---------------------- Edge generator: disease-aware learned edges ----------------------
+
+from typing import Tuple, List, Dict, Any
+# Matplotlib is optional (only required for plotting/animation)
+try:
+    import matplotlib.pyplot as plt
+    from matplotlib import animation
+    _HAS_MATPLOTLIB = True
+except Exception:
+    plt = None
+    animation = None
+    _HAS_MATPLOTLIB = False
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import mutual_info_score
+from scipy.signal import coherence
+
+logging.info(f'Torch version: {torch.__version__} | NumPy version: {np.__version__}')
+
+# Optional imports with graceful fallback (use importlib to avoid static "from X import Y" issues)
+import importlib as _importlib
+
+odeint = None
+pl = None
+h5py = None
+spearmanr = None
+roc_auc_score = None
+average_precision_score = None
+HTML = None
+
+try:
+    _td = _importlib.import_module('torchdiffeq')
+    odeint = getattr(_td, 'odeint', None)
+    _HAS_TORCHDIFFEQ = odeint is not None
+except Exception:
+    odeint = None
+    _HAS_TORCHDIFFEQ = False
+
+try:
+    pl = _importlib.import_module('pytorch_lightning')
+    _HAS_PL = True
+except Exception:
+    pl = None
+    _HAS_PL = False
+
+try:
+    h5py = _importlib.import_module('h5py')
+    _HAS_H5PY = True
+except Exception:
+    h5py = None
+    _HAS_H5PY = False
+
+try:
+    _scipystats = _importlib.import_module('scipy.stats')
+    spearmanr = getattr(_scipystats, 'spearmanr', None)
+    _HAS_SCIPY = spearmanr is not None
+except Exception:
+    spearmanr = None
+    _HAS_SCIPY = False
+
+try:
+    _skm = _importlib.import_module('sklearn.metrics')
+    roc_auc_score = getattr(_skm, 'roc_auc_score', None)
+    average_precision_score = getattr(_skm, 'average_precision_score', None)
+    _HAS_SKLEARN = (roc_auc_score is not None) and (average_precision_score is not None)
+except Exception:
+    roc_auc_score = None
+    average_precision_score = None
+    _HAS_SKLEARN = False
+
+try:
+    _ipyd = _importlib.import_module('IPython.display')
+    HTML = getattr(_ipyd, 'HTML', None)
+    _HAS_IPYTHON = HTML is not None
+except Exception:
+    HTML = None
+    _HAS_IPYTHON = False
+
+warnings.filterwarnings('ignore', category=DeprecationWarning)
+
+
+def set_seed(seed: int = 42) -> int:
+    """Sets random seeds for reproducibility across numpy and torch."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    return seed
+
+set_seed(42)
+
+
+def count_parameters(model: torch.nn.Module) -> int:
+    """Return number of trainable parameters."""
+    return int(sum(p.numel() for p in model.parameters() if p.requires_grad))
+
+
+def _postprocess_adj(tensor: torch.Tensor, mask_diagonal: bool = True, eps: float = 1e-6) -> torch.Tensor:
+    """Symmetrize, apply softplus, normalize per-batch and optionally mask diagonal.
+
+    Args:
+        tensor: (B, N, N) adjacency-like tensor
+        mask_diagonal: whether to zero the diagonal
+        eps: small value to avoid divide-by-zero
+
+    Returns:
+        processed tensor same shape as input
+    """
+    # ensure non-negativity
+    out = F.softplus(tensor)
+    # symmetrize
+    out = 0.5 * (out + out.transpose(1, 2))
+    # normalize per-batch
+    maxv = out.view(out.size(0), -1).max(dim=-1)[0].view(-1, 1, 1) + eps
+    out = out / maxv
+    if mask_diagonal:
+        diag_idx = torch.arange(out.size(1), device=out.device)
+        out[:, diag_idx, diag_idx] = 0.0
+    return out
+
+
+# ---------------------- ADNI dataset loader and helpers ----------------------
+def load_timeseries_file(path: str) -> np.ndarray:
+    """Load per-session ROI timeseries from a variety of formats.
+
+    Supported formats: .npy, .npz (key 'timeseries' or 'data'), .mat (key 'timeseries' or 'data'), .csv
+    Returns array shaped (T, N)
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f'timeseries file not found: {path}')
+
+    if p.suffix == '.npy':
+        return np.load(str(p))
+    if p.suffix == '.npz':
+        arr = np.load(str(p))
+        for k in ('timeseries', 'data', 'ts'):
+            if k in arr:
+                return arr[k]
+        # fallback to first array in archive
+        return arr[list(arr.keys())[0]]
+    if p.suffix == '.mat':
+        mat = scipy.io.loadmat(str(p))
+        for k in ('timeseries', 'data', 'ts'):
+            if k in mat:
+                return np.asarray(mat[k])
+        # try common keys
+        for v in mat.values():
+            if isinstance(v, np.ndarray) and v.ndim == 2:
+                return v
+        raise RuntimeError('No 2D array found in .mat file')
+    if p.suffix == '.csv' or p.suffix == '.txt':
+        return np.loadtxt(str(p), delimiter=',')
+
+    raise ValueError(f'Unsupported timeseries file format: {p.suffix}')
+
+
+def diagnosis_to_label(dx: str) -> int:
+    dx = str(dx).strip().upper()
+    if dx.startswith('CN') or 'CONTROL' in dx:
+        return 0
+    if 'MCI' in dx:
+        return 1
+    if 'AD' in dx or 'ALZ' in dx:
+        return 2
+    # fallback: unknown
+    return -1
+
+
+class ADNIDataset(Dataset):
+    """PyTorch Dataset for loading ADNI ROI timeseries and producing model-ready sequences.
+
+    The `manifest_csv` should contain at minimum columns: `subject_id`, `session_id`, `diagnosis`, `timeseries_path`.
+    Each `timeseries_path` may be absolute or relative to `adni_root`.
+    """
+
+    def __init__(
+        self,
+        manifest_csv: str,
+        adni_root: Optional[str] = None,
+        max_timepoints: Optional[int] = None,
+        harmonize: bool = True,
+        harmonize_batch_col: str = 'site'
+        , use_multimodal: bool = False, multimodal_weights: Optional[Dict[str, float]] = None
+    ):
+        self.df = pd.read_csv(manifest_csv)
+        self.adni_root = Path(adni_root) if adni_root is not None else None
+        self.max_timepoints = max_timepoints
+        self.harmonize = harmonize
+        self.harmonize_batch_col = harmonize_batch_col
+        self.use_multimodal = use_multimodal
+        self.multimodal_weights = multimodal_weights
+
+        # validate required columns
+        required = {'subject_id', 'session_id', 'diagnosis', 'timeseries_path'}
+        if not required.issubset(set(self.df.columns)):
+            raise ValueError(f'manifest must contain columns: {required}')
+
+        # optional multimodal columns we will try to read if present
+        self.optional_columns = {
+            'mmse': 'mmse',
+            'adas_cog': 'adas_cog',
+            'csf_amyloid': 'csf_amyloid',
+            'csf_tau': 'csf_tau',
+            'apoe4': 'apoe4',
+            'site': 'site',
+            'sMRI_path': 'sMRI_path',
+            'pet_path': 'pet_path'
+        }
+
+        # expand timeseries paths
+        def resolve_path(p):
+            pp = Path(p)
+            if pp.exists():
+                return str(pp)
+            if self.adni_root is not None and (self.adni_root / p).exists():
+                return str(self.adni_root / p)
+            return str(pp)
+
+        self.df['timeseries_path'] = self.df['timeseries_path'].apply(resolve_path)
+
+        # harmonization setup: if harmonize and batch column present, we'll apply ComBat later
+        if self.harmonize and (self.harmonize_batch_col not in self.df.columns):
+            # disable harmonization if batch column missing
+            self.harmonize = False
+
+        # precompute cached containers (optionally extend to HDF5 caching)
+        self._cached_node_features = [None] * len(self.df)
+        self._cached_adjacencies = [None] * len(self.df)
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx: int):
+        row = self.df.iloc[idx]
+        ts_path = row['timeseries_path']
+        ts = load_timeseries_file(ts_path)
+        # require (T, N)
+        if ts.ndim == 1:
+            ts = ts.reshape(-1, 1)
+
+        if self.max_timepoints is not None and ts.shape[0] > self.max_timepoints:
+            ts = ts[: self.max_timepoints]
+
+        # compute node features and empirical adjacency per timepoint
+        node_feats = node_features_from_timeseries(ts)
+        # per-timepoint adjacency via Pearson on each window/timepoint's short window
+        T = ts.shape[0]
+        adjs = []
+        for t in range(T):
+            # small window around t (include t-2..t if available)
+            s = max(0, t - 2)
+            e = min(T, t + 1)
+            window = ts[s:e]
+            if self.use_multimodal:
+                adj = compute_multimodal_adjacency(window, weights=self.multimodal_weights)
+                # also compute base components for downstream learnable combination
+                R = compute_empirical_fc_from_timeseries(window)
+                I = compute_mutual_info_matrix(window)
+                C = compute_coherence_matrix(window)
+            else:
+                adj = compute_empirical_fc_from_timeseries(window)
+                R, I, C = None, None, None
+            adjs.append(adj.astype(np.float32))
+        adjs = np.stack(adjs, axis=0)
+
+        label = diagnosis_to_label(row['diagnosis'])
+
+        # read optional multimodal fields
+        multimodal = {}
+        for key, col in self.optional_columns.items():
+            if col in self.df.columns:
+                multimodal[key] = row[col]
+            else:
+                multimodal[key] = None
+
+        sample = {
+            'subject_id': row['subject_id'],
+            'session_id': row['session_id'],
+            'timeseries': ts.astype(np.float32),
+            'node_features': node_feats,  # (T, N, F)
+            'adjacencies': adjs,  # (T, N, N)
+            'adj_R': R if self.use_multimodal else None,
+            'adj_MI': I if self.use_multimodal else None,
+            'adj_coh': C if self.use_multimodal else None,
+            'label': int(label),
+            'multimodal': multimodal
+        }
+        return sample
+
+
+def combat_harmonize(features: np.ndarray, batch: np.ndarray, covars: Optional[object] = None) -> np.ndarray:
+    """Harmonize features matrix (samples x features) using ComBat if available.
+
+    Falls back to returning features unchanged if `neurocombat_sklearn` is not installed.
+    """
+    try:
+        import importlib
+        module = importlib.import_module('neurocombat_sklearn')
+        Combat = getattr(module, 'Combat', None)
+        if Combat is None:
+            # module present but does not expose Combat
+            return features
+    except Exception:
+        # neurocombat not installed or failed to import; return input
+        return features
+
+    cb = Combat()
+    # batch must be 1D array-like
+    harmonized = cb.fit_transform(features, batch, covars)
+    return harmonized
+
+
+# Small CLI to preview ADNI manifest and a few samples
+def _cli_preview(manifest: str, adni_root: Optional[str] = None, n: int = 3):
+    ds = ADNIDataset(manifest, adni_root=adni_root)
+    print(f'Loaded manifest with {len(ds)} sessions. Previewing {n} samples...')
+    for i in range(min(len(ds), n)):
+        s = ds[i]
+        print(f"Subject: {s['subject_id']} | Session: {s['session_id']} | Label: {s['label']} | T={s['timeseries'].shape[0]} | N={s['timeseries'].shape[1]}")
+
+
+class ADNISubjectDataset(Dataset):
+    """Groups ADNI sessions by `subject_id` and returns per-subject longitudinal sequences.
+
+    This dataset wraps `ADNIDataset` and yields one entry per subject. Each item is a
+    dictionary with keys:
+      - 'subject_id'
+      - 'session_ids' : list of session identifiers in chronological (or session_id) order
+      - 'sessions' : list of per-session sample dicts returned by `ADNIDataset.__getitem__`
+
+    Helpful utilities are provided for collating a batch of subjects into padded tensors
+    for use in model training (`collate_subject_batch`).
+    """
+
+    def __init__(
+        self,
+        manifest_csv: str,
+        adni_root: Optional[str] = None,
+        max_timepoints: Optional[int] = None,
+        min_sessions: int = 1,
+        harmonize: bool = True,
+        sort_by_date: bool = True,
+        use_multimodal: bool = False,
+        multimodal_weights: Optional[Dict[str, float]] = None,
+    ):
+        self.base = ADNIDataset(manifest_csv, adni_root=adni_root, max_timepoints=max_timepoints,
+                                harmonize=harmonize, use_multimodal=use_multimodal, multimodal_weights=multimodal_weights)
+        df = self.base.df.copy()
+        # parse session_date if present for reliable chronological ordering
+        if 'session_date' in df.columns:
+            try:
+                df['session_date'] = pd.to_datetime(df['session_date'])
+            except Exception:
+                # leave as-is if parsing fails
+                pass
+
+        grouped = df.groupby('subject_id')
+        self.subject_ids: List[str] = []
+        self.subject_indices: List[List[int]] = []
+
+        for sid, g in grouped:
+            if sort_by_date and 'session_date' in g.columns:
+                order = g.sort_values('session_date').index.tolist()
+            else:
+                # fall back to session_id sorting (string-sortable)
+                order = g.sort_values('session_id').index.tolist()
+            if len(order) >= min_sessions:
+                self.subject_ids.append(sid)
+                self.subject_indices.append(order)
+
+        self.min_sessions = min_sessions
+
+    def __len__(self) -> int:
+        return len(self.subject_ids)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        indices = self.subject_indices[idx]
+        sessions = [self.base[int(i)] for i in indices]
+        return {
+            'subject_id': self.subject_ids[idx],
+            'session_ids': [s['session_id'] for s in sessions],
+            'sessions': sessions
+        }
+
+    def collate_subject_batch(self, subjects: List[Dict[str, Any]], pad_T: Optional[int] = None) -> Dict[str, Any]:
+        """Collate a list of subject items (as returned by __getitem__) into padded tensors.
+
+        Returns a dict with:
+          - 'node_features': (B, S, T, N, F) float tensor
+          - 'adjacencies' : (B, S, T, N, N) float tensor
+          - 'mask' : (B, S, T) boolean tensor indicating valid timesteps
+          - 'labels' : (B, S) integer labels per session
+          - 'subject_ids' : list of subject ids in order
+        """
+        B = len(subjects)
+        S = max(len(s['sessions']) for s in subjects)
+        # infer N,F,T
+        first = subjects[0]['sessions'][0]
+        N = first['node_features'].shape[1]
+        F = first['node_features'].shape[2]
+
+        max_T = 0
+        for subj in subjects:
+            for sess in subj['sessions']:
+                max_T = max(max_T, sess['node_features'].shape[0])
+        if pad_T is not None:
+            max_T = max(max_T, pad_T)
+
+        node_feats = np.zeros((B, S, max_T, N, F), dtype=np.float32)
+        adjs = np.zeros((B, S, max_T, N, N), dtype=np.float32)
+        mask = np.zeros((B, S, max_T), dtype=bool)
+        labels = np.zeros((B, S), dtype=np.int64)
+
+        for i, subj in enumerate(subjects):
+            for j, sess in enumerate(subj['sessions']):
+                t = sess['node_features'].shape[0]
+                node_feats[i, j, :t] = sess['node_features']
+                adjs[i, j, :t] = sess['adjacencies']
+                labels[i, j] = sess['label']
+                mask[i, j, :t] = True
+
+        return {
+            'node_features': torch.tensor(node_feats),
+            'adjacencies': torch.tensor(adjs),
+            'mask': torch.tensor(mask),
+            'labels': torch.tensor(labels),
+            'subject_ids': [s['subject_id'] for s in subjects]
+        }
+
+
+# EdgeGenerator: learned edge-generation function (placed after torch imports)
+class EdgeGenerator(nn.Module):
+    """Learned edge generation function g_theta(x_i, x_j).
+
+    Produces a symmetric adjacency matrix from node embeddings and optional latent state.
+    """
+
+    def __init__(self, node_dim: int, latent_dim: Optional[int] = None, hidden: int = 128):
+        super().__init__()
+        self.node_dim = node_dim
+        self.latent_dim = latent_dim
+        in_dim = 2 * node_dim + (latent_dim or 0)
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden // 2),
+            nn.ReLU(),
+            nn.Linear(hidden // 2, 1)
+        )
+
+    def forward(self, node_embeddings: torch.Tensor, latent_state: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # node_embeddings: (B, N, D), latent_state: (B, L)
+        B, N, D = node_embeddings.shape
+        h_i = node_embeddings.unsqueeze(2).expand(B, N, N, D)
+        h_j = node_embeddings.unsqueeze(1).expand(B, N, N, D)
+        if latent_state is not None:
+            z = latent_state.view(B, 1, 1, -1).expand(B, N, N, latent_state.size(-1))
+            inputs = torch.cat([h_i, h_j, z], dim=-1)
+        else:
+            inputs = torch.cat([h_i, h_j], dim=-1)
+
+        out = self.mlp(inputs.view(B * N * N, -1)).view(B, N, N)
+        # postprocess: softplus, symmetrize, normalize (do not mask diagonal here)
+        out = _postprocess_adj(out, mask_diagonal=False)
+        return out
+
+
+class ImportanceHead(nn.Module):
+    """Produce node-level and edge-level importance probabilities.
+
+    - node_head outputs per-node probability in (0,1)
+    - edge_head outputs per-edge probability in (0,1)
+    """
+    def __init__(self, node_dim: int, hidden: int = 64):
+        super().__init__()
+        self.node_mlp = nn.Sequential(
+            nn.Linear(node_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 1)
+        )
+        # edge head uses concatenated node embeddings
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(2 * node_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 1)
+        )
+
+    def forward(self, node_embeddings: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # node_embeddings: (B, N, D)
+        B, N, D = node_embeddings.shape
+        node_logits = self.node_mlp(node_embeddings.view(B * N, D)).view(B, N)
+        node_prob = torch.sigmoid(node_logits)
+
+        h_i = node_embeddings.unsqueeze(2).expand(B, N, N, D)
+        h_j = node_embeddings.unsqueeze(1).expand(B, N, N, D)
+        edge_inputs = torch.cat([h_i, h_j], dim=-1)
+        edge_logits = self.edge_mlp(edge_inputs.view(B * N * N, 2 * D)).view(B, N, N)
+        edge_prob = torch.sigmoid(edge_logits)
+        return node_prob, edge_prob
+
+# ---------------------- Simulation: Synthetic Longitudinal Connectomes ----------------------
+
+def simulate_subject_sequence(
+    num_regions: int = 16,
+    num_timepoints: int = 6,
+    seed: Optional[int] = None,
+    degenerate_regions: Optional[List[int]] = None,
+    noise_level: float = 0.05,
+    disease_heterogeneity: bool = False,
+    cascade_hops: int = 2
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
+    """Simulates a subject's sequence of adjacency matrices and node features with realistic disease progression.
+
+    Args:
+        num_regions: Number of brain regions (nodes).
+        num_timepoints: Number of timepoints in the sequence.
+        seed: Random seed for reproducibility.
+        degenerate_regions: List of indices for regions that start degenerating.
+        noise_level: Magnitude of measurement noise added to adjacency matrices.
+        disease_heterogeneity: If True, simulates non-linear/heterogeneous disease progression.
+        cascade_hops: Number of hops for disease propagation through the network.
+
+    Returns:
+        node_features_sequence: (T, N, F) Node features over time (F=3).
+        adjacency_matrices_sequence: (T, N, N) Adjacency matrices over time.
+        time_indices: (T,) Array of time indices.
+        metadata: Dictionary containing simulation parameters and disease state info.
+    """
+    if seed is not None:
+        rng = np.random.RandomState(seed)
+    else:
+        rng = np.random
+
+    num_features = 3
+    # Base adjacency with realistic community structure (e.g., functional networks)
+    base_adjacency = rng.randn(num_regions, num_regions) * 0.3
+
+    # Create community structure
+    num_communities = max(2, num_regions // 6)
+    # Ensure labels array length equals num_regions by tiling label indices and slicing.
+    # Using ceil division guarantees we have enough repeats even when num_regions is not
+    # divisible by num_communities (previous code could produce a too-short labels array).
+    reps = int(math.ceil(num_regions / num_communities))
+    labels = np.tile(np.arange(num_communities), reps)[:num_regions]
+
+    for i in range(num_regions):
+        for j in range(num_regions):
+            if labels[i] == labels[j]:
+                base_adjacency[i, j] += 0.8
+
+    # Symmetrize and normalize
+    base_adjacency = 0.5 * (base_adjacency + base_adjacency.T)
+    base_adjacency = np.abs(base_adjacency)
+    base_adjacency = base_adjacency / (base_adjacency.max() + 1e-6)
+
+    if degenerate_regions is None:
+        # Randomly select regions to degenerate if not provided
+        num_degenerate = max(1, num_regions // 8)
+        degenerate_regions = rng.choice(num_regions, num_degenerate, replace=False).tolist()
+
+    assert degenerate_regions is not None
+    degenerate_regions = list(degenerate_regions)
+    # ensure affected_list is defined even if the time loop does not execute
+    affected_list = list(degenerate_regions)
+
+    # Disease progression trajectory
+    if disease_heterogeneity:
+        # Sigmoid-like curve: slow initial, rapid middle, plateau late
+        progression_curve = 1.0 / (1.0 + np.exp(-3.0 * (np.arange(num_timepoints) / num_timepoints - 0.5)))
+    else:
+        # Linear progression
+        progression_curve = np.linspace(0, 1, num_timepoints)
+
+    adjacency_matrices_sequence = []
+    node_features_sequence = []
+
+    for t in range(num_timepoints):
+        # Cascade effect: disease spreads via connectivity graph
+        affected_regions = set(degenerate_regions)
+        for _ in range(cascade_hops):
+            newly_affected = set()
+            for region in affected_regions:
+                # Find connected neighbors with significant weight
+                neighbors = np.where(base_adjacency[region, :] > 0.3)[0]
+                newly_affected.update(neighbors.tolist())
+            affected_regions.update(newly_affected)
+
+        affected_list = list(affected_regions)
+
+        # Calculate decay factor based on progression
+        current_progression = progression_curve[t]
+        if disease_heterogeneity:
+            decay_factor = 1.0 - 0.2 * (current_progression**1.5)
+        else:
+            decay_factor = 1.0 - 0.15 * current_progression
+
+        # Apply decay to adjacency matrix
+        current_adjacency = base_adjacency.copy()
+        for r in affected_list:
+            # Primary degenerate regions decay faster than secondary affected ones
+            region_factor = 0.7 if r in degenerate_regions else 0.85
+            region_decay = decay_factor ** region_factor
+            current_adjacency[r, :] *= region_decay
+            current_adjacency[:, r] *= region_decay
+
+        # Add measurement noise
+        current_adjacency += noise_level * rng.randn(num_regions, num_regions)
+        current_adjacency = 0.5 * (current_adjacency + current_adjacency.T)
+        current_adjacency = np.clip(current_adjacency, 0.0, None)
+
+        # Normalize
+        max_val = current_adjacency.max()
+        if max_val > 1e-6:
+            current_adjacency = current_adjacency / max_val
+        adjacency_matrices_sequence.append(current_adjacency)
+
+        # Generate node features: Volumetric, Biomarker, Functional
+        base_features = rng.randn(num_regions, num_features) * 0.2 + 0.5
+        for r in affected_list:
+            strength = 0.08 if r in degenerate_regions else 0.03
+            # Feature 0: Regional volume decline (MRI-like)
+            base_features[r, 0] -= strength * current_progression
+            # Feature 1: Pathological biomarker increase (tau/amyloid-like)
+            base_features[r, 1] += 0.06 * current_progression
+            # Feature 2: Functional connectivity decline
+            base_features[r, 2] -= 0.07 * current_progression
+
+        base_features = np.clip(base_features, -1.0, 2.0)
+        node_features_sequence.append(base_features)
+
+    adjacency_matrices_sequence = np.stack(adjacency_matrices_sequence, axis=0).astype(np.float32)
+    node_features_sequence = np.stack(node_features_sequence, axis=0).astype(np.float32)
+    time_indices = np.arange(num_timepoints, dtype=np.float32)
+
+    metadata = {
+        'degenerate_regions': degenerate_regions,
+        'affected_regions': affected_list,
+        'labels': labels.tolist(),
+        'disease_progression': progression_curve.tolist(),
+        'cascade_hops': cascade_hops
+    }
+    return node_features_sequence, adjacency_matrices_sequence, time_indices, metadata
+
+# Quick sanity checks removed. Use the CLI/validation at the bottom of the file for demos and validation.
+
+# ---------------------- Dataset and DataLoader ----------------------
+
+class SimulatedDDGDataset(Dataset):
+    """Dataset class for generating and serving synthetic disease progression data."""
+
+    def __init__(
+        self,
+        num_subjects: int = 200,
+        num_regions: int = 16,
+        num_timepoints: int = 6,
+        seed: int = 0,
+        noise_level: float = 0.03
+    ):
+        self.num_subjects = num_subjects
+        self.num_regions = num_regions
+        self.num_timepoints = num_timepoints
+        self.seed = seed
+        self.data = []
+
+        rng = np.random.RandomState(seed)
+        for s in range(num_subjects):
+            sub_seed = rng.randint(0, 2**31 - 1)
+            # Vary number of degenerate regions per subject
+            num_degenerate = max(1, num_regions // 12)
+            degenerate_indices = rng.choice(num_regions, num_degenerate, replace=False).tolist()
+
+            node_features, adjacency_matrices, times, meta = simulate_subject_sequence(
+                num_regions=num_regions,
+                num_timepoints=num_timepoints,
+                seed=sub_seed,
+                degenerate_regions=degenerate_indices,
+                noise_level=noise_level
+            )
+
+            # Clinical target: e.g., final-stage cognitive score inversely related to mean strength of degenerate regions
+            final_adj = adjacency_matrices[-1]
+            deg_mean_strength = final_adj[degenerate_indices, :].mean()
+
+            # Simulate MMSE (Mini-Mental State Exam) score: 0-30 scale
+            # Lower connectivity in degenerate regions -> Lower MMSE
+            cognitive_score = 30.0 - 12.0 * (1.0 - deg_mean_strength) + rng.randn() * 0.8
+            cognitive_score = float(np.clip(cognitive_score, 0.0, 30.0))
+
+            self.data.append({
+                'node_features': node_features,
+                'adjacency_matrices': adjacency_matrices,
+                'times': times,
+                'metadata': meta,
+                'cognitive_score': cognitive_score
+            })
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        return self.data[idx]
+
+
+def collate_batch(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+    """Collates a list of dataset items into a batch."""
+    batch_size = len(batch)
+    num_timepoints = batch[0]['node_features'].shape[0]
+    num_regions = batch[0]['node_features'].shape[1]
+    num_features = batch[0]['node_features'].shape[2]
+
+    # Validate shapes
+    for i, item in enumerate(batch):
+        if item['node_features'].shape != (num_timepoints, num_regions, num_features):
+            raise RuntimeError(
+                f'Inconsistent shapes in batch item {i}: '
+                f'expected (T={num_timepoints}, N={num_regions}, F={num_features}), '
+                f'got {item["node_features"].shape}'
+            )
+
+    # Stack items
+    node_features = np.stack([b['node_features'] for b in batch], axis=0)  # (B, T, N, F)
+    adjacency_matrices = np.stack([b['adjacency_matrices'] for b in batch], axis=0)  # (B, T, N, N)
+    cognitive_scores = np.array([b['cognitive_score'] for b in batch], dtype=np.float32)
+
+    return {
+        'node_features': torch.tensor(node_features),
+        'adjacency_matrices': torch.tensor(adjacency_matrices),
+        'cognitive_scores': torch.tensor(cognitive_scores)
+    }
+
+# (Removed duplicated quick dataset check) See CLI/validation at the bottom of the file for demos and checks.
+
+# ---------------------- Model components ----------------------
+
+class GraphEncoder(nn.Module):
+    """Encodes node features into embeddings using a simple GCN-like layer."""
+
+    def __init__(self, in_features: int, hidden_dim: int):
+        super().__init__()
+        # Replace simple MLP with a multi-head GAT encoder to perform proper message passing
+        self.gat = None
+        # we'll initialize lazily to keep signature simple
+        self._in_features = in_features
+        self._hidden_dim = hidden_dim
+
+    def forward(self, node_features: torch.Tensor, adjacency_matrix: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            node_features: (B, N, F) Input node features.
+            adjacency_matrix: (B, N, N) Adjacency matrix (optional).
+
+        Returns:
+            node_embeddings: (B, N, D) Encoded node embeddings.
+        """
+        # Lazy init GAT (to know node feature dim)
+        if self.gat is None:
+            # use 4 heads by default, head dim = hidden_dim // heads
+            num_heads = 4
+            head_dim = max(8, self._hidden_dim // num_heads)
+            self.gat = GATEncoder(self._in_features, self._hidden_dim, num_heads=num_heads, head_dim=head_dim)
+
+        # node_features: (B, N, F)
+        if adjacency_matrix is None:
+            # If no adjacency provided, derive a lightweight empirical adjacency from features
+            # so the encoder always performs graph message passing (avoids silent MLP fallback).
+            # Compute unnormalized similarity (batchwise inner product)
+            x = node_features
+            sim = torch.matmul(x, x.transpose(1, 2))  # (B, N, N)
+            # remove self-similarity
+            diag_idx = torch.arange(sim.size(1), device=sim.device)
+            sim[:, diag_idx, diag_idx] = 0.0
+            adjacency_matrix = _postprocess_adj(sim, mask_diagonal=True)
+
+        return self.gat(node_features, adjacency_matrix)
+
+
+class GATEncoder(nn.Module):
+    """Multi-head GAT encoder that performs attention-weighted message passing using adjacency as mask.
+
+    Inputs:
+        in_feats: input feature dim
+        out_feats: output feature dim (total, across heads)
+        num_heads: number of attention heads
+        head_dim: inner head dimension
+
+    Returns node embeddings of shape (B, N, out_feats)
+    """
+    def __init__(self, in_feats: int, out_feats: int, num_heads: int = 4, head_dim: int = 16, dropout: float = 0.2):
+        super().__init__()
+        self.in_feats = in_feats
+        self.out_feats = out_feats
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.dropout = dropout
+
+        # linear projection to (num_heads * head_dim)
+        self.fc = nn.Linear(in_feats, num_heads * head_dim, bias=False)
+
+        # attention vectors: a_l and a_r per head (to compute e_ij = a_l^T Wh_i + a_r^T Wh_j)
+        self.a_l = nn.Parameter(torch.Tensor(1, num_heads, head_dim))
+        self.a_r = nn.Parameter(torch.Tensor(1, num_heads, head_dim))
+
+        self.leaky = nn.LeakyReLU(0.2)
+        self.out_proj = nn.Linear(num_heads * head_dim, out_feats)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.fc.weight)
+        nn.init.xavier_uniform_(self.out_proj.weight)
+        nn.init.xavier_uniform_(self.a_l)
+        nn.init.xavier_uniform_(self.a_r)
+
+    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        # x: (B, N, F), adj: (B, N, N)
+        B, N, _ = x.shape
+        device = x.device
+
+        Wh = self.fc(x)  # (B, N, H*num_heads)
+        Wh = Wh.view(B, N, self.num_heads, self.head_dim)  # (B, N, heads, head_dim)
+
+        # compute attention coefficients efficiently: e_ij = a_l*Wh_i + a_r*Wh_j
+        a_l = (Wh * self.a_l).sum(dim=-1)  # (B, N, heads)
+        a_r = (Wh * self.a_r).sum(dim=-1)  # (B, N, heads)
+
+        # e_ij = a_l_i + a_r_j
+        e = a_l.unsqueeze(2) + a_r.unsqueeze(1)  # (B, N, N, heads)
+        e = self.leaky(e)
+
+        # transpose to (B, heads, N, N)
+        e = e.permute(0, 3, 1, 2)
+
+        # mask with adjacency: where adj <= 0, set -inf
+        if adj.dtype != torch.bool:
+            mask = (adj > 0)
+        else:
+            mask = adj
+        mask = mask.unsqueeze(1)  # (B,1,N,N)
+        neg_inf = -9e15
+        e = torch.where(mask, e, torch.full_like(e, neg_inf))
+
+        # softmax across neighbors
+        alpha = torch.softmax(e, dim=-1)  # (B, heads, N, N)
+        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
+
+        # aggregate values: values = Wh (B,N,heads,head_dim) -> (B, heads, N, head_dim)
+        V = Wh.permute(0, 2, 1, 3)  # (B, heads, N, head_dim)
+        out = torch.matmul(alpha, V)  # (B, heads, N, head_dim)
+        out = out.permute(0, 2, 1, 3).contiguous().view(B, N, self.num_heads * self.head_dim)
+
+        out = self.out_proj(out)
+        out = F.elu(out)
+        # small stochastic regularization on outputs
+        out = F.dropout(out, p=self.dropout, training=self.training)
+        return out
+
+class ZEncoderGRU(nn.Module):
+    """Encodes the sequence of node embeddings into a latent disease state vector."""
+
+    def __init__(self, node_dim: int, latent_dim: int, rnn_hidden: int = 64):
+        super().__init__()
+        # Pooling function: Average over nodes
+        self.pool = lambda embeddings: embeddings.mean(dim=2)  # (B, T, N, D) -> (B, T, D)
+        self.gru = nn.GRU(node_dim, rnn_hidden, batch_first=True)
+        self.fc = nn.Sequential(nn.Linear(rnn_hidden, latent_dim), nn.Tanh())
+
+    def forward(self, node_embeddings_sequence: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            node_embeddings_sequence: (B, T, N, D) Sequence of node embeddings.
+
+        Returns:
+            latent_state: (B, latent_dim) Final latent disease state.
+        """
+        # Pool over nodes to get graph-level sequence
+        graph_sequence = self.pool(node_embeddings_sequence)  # (B, T, D)
+        _, hidden_state = self.gru(graph_sequence)  # hidden_state: (1, B, H)
+        latent_state = self.fc(hidden_state.squeeze(0))
+        return latent_state
+
+
+class VAEZEncoder(nn.Module):
+    """VAE-style graph-level encoder: pools node embeddings over nodes, runs GRU,
+    and outputs mu/logvar and sampled z (reparameterized).
+    """
+    def __init__(self, node_dim: int, latent_dim: int, rnn_hidden: int = 64):
+        super().__init__()
+        self.pool = lambda embeddings: embeddings.mean(dim=2)
+        self.gru = nn.GRU(node_dim, rnn_hidden, batch_first=True)
+        self.fc_mu = nn.Linear(rnn_hidden, latent_dim)
+        self.fc_logvar = nn.Linear(rnn_hidden, latent_dim)
+
+    def forward(self, node_embeddings_sequence: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # node_embeddings_sequence: (B, T, N, D)
+        graph_sequence = self.pool(node_embeddings_sequence)  # (B, T, D)
+        _, hidden_state = self.gru(graph_sequence)
+        h = hidden_state.squeeze(0)
+        mu = self.fc_mu(h)
+        logvar = self.fc_logvar(h)
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        z = mu + eps * std
+        return z, mu, logvar
+
+
+class VAEReconstructor(nn.Module):
+    """RNN-based decoder that maps graph-level latent `z` to reconstructed node-feature sequences.
+
+    Design:
+    - Map `z` -> initial hidden state for a temporal GRU decoder.
+    - Use a learned node embedding template; at each decode step, combine the node template with GRU output
+      to produce per-node features (B, T, N, F).
+    - This produces a compact, trainable temporal decoder without duplicating per-node RNNs.
+    """
+    def __init__(self, latent_dim: int, node_dim: int, out_feats: int = 4, hidden: int = 128, T_out: int = 6):
+        super().__init__()
+        self.T_out = T_out
+        self.out_feats = out_feats
+        self.node_dim = node_dim
+
+        # Project latent z to GRU initial hidden
+        self.z_to_hidden = nn.Linear(latent_dim, hidden)
+        # Temporal GRU that produces a context vector per timestep
+        self.gru = nn.GRU(input_size=node_dim, hidden_size=hidden, batch_first=True)
+
+        # Learned node template embeddings (shared across batch/time)
+        self.node_template = nn.Parameter(torch.randn(1, 1, node_dim))
+
+        # Map GRU output + node template -> per-node features
+        self.readout = nn.Sequential(
+            nn.Linear(hidden + node_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, out_feats)
+        )
+
+    def forward(self, z: torch.Tensor, num_nodes: int) -> torch.Tensor:
+        """Return reconstructed node features of shape (B, T_out, N, F).
+
+        Args:
+            z: (B, L)
+            num_nodes: number of nodes N
+        """
+        B = z.size(0)
+        device = z.device
+        # initial hidden for GRU: (1, B, hidden)
+        h0 = self.z_to_hidden(z).unsqueeze(0)
+
+        # prepare decoder inputs: repeat node_template as sequence input
+        # input to GRU is per-timestep input of dimension node_dim; we use the template repeated
+        inp = self.node_template.expand(B, self.T_out, -1).to(device)  # (B, T, node_dim)
+
+        gru_out, _ = self.gru(inp, h0)  # (B, T, hidden)
+
+        # expand node template to per-node and combine with gru_out per time
+        node_template_exp = self.node_template.expand(B, self.T_out, -1)  # (B, T, node_dim)
+        # concatenate per-timestep context with node template, then map to per-node features
+        # we'll broadcast over nodes: produce (B, T, 1, F) then expand to (B, T, N, F)
+        concat = torch.cat([gru_out, node_template_exp], dim=-1)  # (B, T, hidden+node_dim)
+        step_feat = self.readout(concat)  # (B, T, F)
+        step_feat = step_feat.unsqueeze(2).expand(B, self.T_out, num_nodes, self.out_feats)
+        return step_feat
+
+
+class _ODEFuncDecoder(nn.Module):
+    """Simple MLP vector field for ODE reconstructor."""
+    def __init__(self, hidden_dim: int, node_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh()
+        )
+
+    def forward(self, t, h):
+        return self.net(h)
+
+
+class VAEODEReconstructor(nn.Module):
+    """ODE-based decoder that integrates a latent initial state to produce temporal context
+    and decodes to node-feature sequences.
+
+    If `torchdiffeq.odeint` is not available at runtime, this class will fall back to the
+    RNN-based `VAEReconstructor` behavior for robustness in environments without the
+    optional dependency.
+    """
+    def __init__(self, latent_dim: int, node_dim: int, out_feats: int = 4, hidden: int = 128, T_out: int = 6, ode_solver: str = 'rk4'):
+        super().__init__()
+        self.T_out = T_out
+        self.out_feats = out_feats
+        self.node_dim = node_dim
+        self.hidden = hidden
+        self.ode_solver = ode_solver
+
+        # projection z -> initial hidden for ODE
+        self.z_to_h0 = nn.Linear(latent_dim, hidden)
+        # ODE func
+        self.func = _ODEFuncDecoder(hidden, node_dim)
+
+        # learned node template
+        self.node_template = nn.Parameter(torch.randn(1, node_dim))
+
+        # readout from ODE hidden + node template to node features
+        self.readout = nn.Sequential(
+            nn.Linear(hidden + node_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, out_feats)
+        )
+
+        # fallback RNN decoder for environments without torchdiffeq
+        self._fallback = VAEReconstructor(latent_dim, node_dim, out_feats=out_feats, hidden=hidden, T_out=T_out)
+
+    def forward(self, z: torch.Tensor, num_nodes: int) -> torch.Tensor:
+        # Try to use torchdiffeq. If not available, fall back to RNN reconstructor.
+        try:
+            from torchdiffeq import odeint
+        except Exception:
+            return self._fallback(z, num_nodes)
+
+        B = z.size(0)
+        device = z.device
+        h0 = self.z_to_h0(z)  # (B, hidden)
+
+        # integrate over normalized time [0,1] at T_out points
+        t = torch.linspace(0.0, 1.0, self.T_out, device=device)
+        # odeint expects (B, hidden) as initial, but returns (T, B, hidden) when batch_first False
+        h0_batch = h0
+        try:
+            H = odeint(self.func, h0_batch, t, method=self.ode_solver)  # (T, B, hidden)
+        except Exception:
+            # try with default solver
+            H = odeint(self.func, h0_batch, t)
+
+        # permute to (B, T, hidden)
+        H = H.permute(1, 0, 2)
+
+        # expand node template per timestep and decode
+        node_tmpl = self.node_template.unsqueeze(0).unsqueeze(0).expand(B, self.T_out, -1).to(device)  # (B,T,node_dim)
+        concat = torch.cat([H, node_tmpl], dim=-1)  # (B,T,hidden+node_dim)
+        step_feat = self.readout(concat)  # (B,T,out_feats)
+        step_feat = step_feat.unsqueeze(2).expand(B, self.T_out, num_nodes, self.out_feats)
+        return step_feat
+
+class PerEdgeMLP(nn.Module):
+    """Predicts next-step adjacency matrix using an MLP on edge and node features."""
+
+    def __init__(self, node_dim: int, latent_dim: int, hidden_dim: int = 128, mask_diagonal: bool = True):
+        super().__init__()
+        self.node_dim = node_dim
+        self.latent_dim = latent_dim
+        self.mask_diagonal = mask_diagonal
+        # reduce default hidden_dim and add stronger dropout for regularization
+        self.mlp = nn.Sequential(
+            nn.Linear(1 + 2 * node_dim + latent_dim, max(64, hidden_dim // 2)),
+            nn.BatchNorm1d(max(64, hidden_dim // 2)),
+            nn.ReLU(),
+            nn.Dropout(0.25),
+            nn.Linear(max(64, hidden_dim // 2), max(64, hidden_dim // 2)),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(max(64, hidden_dim // 2), 1)
+        )
+
+    def forward(self, adjacency_matrix: torch.Tensor, node_embeddings: torch.Tensor, latent_state: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            adjacency_matrix: (B, N, N) Current adjacency.
+            node_embeddings: (B, N, D) Current node embeddings.
+            latent_state: (B, latent_dim) Disease state.
+
+        Returns:
+            next_adjacency: (B, N, N) Predicted next adjacency.
+        """
+        batch_size, num_nodes, _ = adjacency_matrix.shape
+        embedding_dim = node_embeddings.size(-1)
+
+        # Expand latent state to edges
+        z_expanded = latent_state.view(batch_size, 1, 1, -1).expand(batch_size, num_nodes, num_nodes, self.latent_dim)
+
+        # Expand node embeddings to edges (source and target)
+        h_i = node_embeddings.unsqueeze(2).expand(batch_size, num_nodes, num_nodes, embedding_dim)
+        h_j = node_embeddings.unsqueeze(1).expand(batch_size, num_nodes, num_nodes, embedding_dim)
+
+        edge_input = adjacency_matrix.unsqueeze(-1)
+
+        # Concatenate all features
+        inputs = torch.cat([edge_input, h_i, h_j, z_expanded], dim=-1)
+
+        # Pass through MLP (flatten first)
+        outputs = self.mlp(inputs.view(batch_size * num_nodes * num_nodes, -1))
+        outputs = outputs.view(batch_size, num_nodes, num_nodes, 1)
+
+        next_adjacency = outputs.squeeze(-1)
+        # use centralized postprocessing
+        next_adjacency = _postprocess_adj(next_adjacency, mask_diagonal=self.mask_diagonal)
+        return next_adjacency
+
+class EdgeGRUCell(nn.Module):
+    """GRU Cell operating on edge features."""
+
+    def __init__(self, input_dim: int, hidden_dim: int):
+        super().__init__()
+        self.cell = nn.GRUCell(input_dim, hidden_dim)
+        self.readout = nn.Linear(hidden_dim, 1)
+
+    def forward(self, edge_features: torch.Tensor, hidden_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # edge_features: (B, E, input_dim), hidden_state: (B, E, hidden_dim)
+        batch_size, num_edges, _ = edge_features.shape
+
+        h_flat = hidden_state.view(batch_size * num_edges, -1)
+        inp_flat = edge_features.view(batch_size * num_edges, -1)
+
+        h_next = self.cell(inp_flat, h_flat)
+        out = self.readout(h_next)
+
+        return h_next.view(batch_size, num_edges, -1), out.view(batch_size, num_edges)
+
+
+class EdgeGRU(nn.Module):
+    """Recurrent edge evolution model."""
+
+    def __init__(self, node_dim: int, latent_dim: int, hidden_dim: int = 32, mask_diagonal: bool = True):
+        super().__init__()
+        self.node_dim = node_dim
+        self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim
+        self.mask_diagonal = mask_diagonal
+        self.cell = EdgeGRUCell(input_dim=1 + 2 * node_dim + latent_dim, hidden_dim=hidden_dim)
+
+    def forward(
+        self,
+        adjacency_matrix: torch.Tensor,
+        node_embeddings: torch.Tensor,
+        latent_state: torch.Tensor,
+        prev_hidden_state: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        batch_size, num_nodes, _ = adjacency_matrix.shape
+        embedding_dim = node_embeddings.size(-1)
+
+        h_i = node_embeddings.unsqueeze(2).expand(batch_size, num_nodes, num_nodes, embedding_dim)
+        h_j = node_embeddings.unsqueeze(1).expand(batch_size, num_nodes, num_nodes, embedding_dim)
+        z_expanded = latent_state.view(batch_size, 1, 1, -1).expand(batch_size, num_nodes, num_nodes, self.latent_dim)
+
+        edge_input = adjacency_matrix.unsqueeze(-1)
+        features = torch.cat([edge_input, h_i, h_j, z_expanded], dim=-1)
+
+        num_edges_total = num_nodes * num_nodes
+        features_flat = features.view(batch_size, num_edges_total, -1)
+
+        if prev_hidden_state is None:
+            prev_hidden_state = torch.zeros(
+                batch_size, num_edges_total, self.hidden_dim,
+                device=adjacency_matrix.device, dtype=adjacency_matrix.dtype
+            )
+
+        next_hidden_state, out_flat = self.cell(features_flat, prev_hidden_state)
+
+        out = out_flat.view(batch_size, num_nodes, num_nodes)
+        out = _postprocess_adj(out, mask_diagonal=self.mask_diagonal)
+        return out, next_hidden_state
+
+
+class CovariateParamNet(nn.Module):
+    """Map subject covariates to positive dynamical scalars (kappa, gamma, sigma)."""
+    def __init__(self, cov_dim: int, hidden: int = 32, eps: float = 1e-6):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(cov_dim, hidden),
+            nn.ReLU(),
+            nn.Dropout(0.15),
+            nn.Linear(hidden, 3)
+        )
+        self.softplus = nn.Softplus()
+        self.eps = eps
+
+    def forward(self, covariates: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # covariates: (B, C) -> return (kappa, gamma, sigma) each (B,1)
+        out = self.net(covariates)
+        out = self.softplus(out) + self.eps
+        kappa = out[:, 0:1]
+        gamma = out[:, 1:2]
+        sigma = out[:, 2:3]
+        return kappa, gamma, sigma
+
+
+class BiophysicalDiffusionEvolution(nn.Module):
+    """Deterministic biophysical diffusion prior on adjacency matrices.
+
+    - Implements simple graph diffusion dynamics on adjacency matrices:
+        dE/dt = -kappa * (L E + E L) / 2 - gamma * E + R(E, H, z)
+      where L is graph Laplacian of E (symmetric), and R is a learnable residual (PerEdgeMLP) to capture non-biophysical effects.
+
+    - Integration done with simple forward-Euler steps for robustness if torchdiffeq missing.
+    - kappa/gamma are provided per-subject via covariates using CovariateParamNet.
+    """
+    def __init__(self, node_dim: int, latent_dim: int, cov_dim: int = 3, residual_hidden: int = 128, n_steps: int = 8, dt: float = 1.0):
+        super().__init__()
+        self.node_dim = node_dim
+        self.latent_dim = latent_dim
+        self.n_steps = int(max(1, n_steps))
+        self.dt = float(dt)
+        self.param_net = CovariateParamNet(cov_dim, hidden=32)
+        # residual model operates per-edge and returns correction to adjacency
+        self.residual = PerEdgeMLP(node_dim=node_dim, latent_dim=latent_dim, hidden_dim=residual_hidden, mask_diagonal=True)
+
+    def _laplacian(self, A: torch.Tensor) -> torch.Tensor:
+        # A: (B,N,N) -> L = D - A, computed per-batch
+        deg = torch.sum(A, dim=-1)  # (B,N)
+        D = torch.zeros_like(A)
+        idx = torch.arange(A.size(-1), device=A.device)
+        D[:, idx, idx] = deg
+        L = D - A
+        return L
+
+    def forward(self, E_t: torch.Tensor, H_t: Optional[torch.Tensor], z_t: torch.Tensor, covariates: Optional[torch.Tensor] = None, t_span: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            E_t: (B,N,N) current adjacency
+            H_t: (B,N,D) node embeddings (optional)
+            z_t: (B, latent_dim) subject latent
+            covariates: (B, cov_dim) subject covariates (APOE, CSF, etc.)
+        Returns:
+            E_next: (B,N,N) evolved adjacency after integration window
+        """
+        B, N, _ = E_t.shape
+        device = E_t.device
+
+        if covariates is None:
+            # default neutral covariates
+            covariates = torch.zeros(B, 3, device=device, dtype=E_t.dtype)
+
+        kappa, gamma, _ = self.param_net(covariates)  # (B,1)
+        # broadcast scalars
+        kappa = kappa.view(B, 1, 1)
+        gamma = gamma.view(B, 1, 1)
+
+        E = E_t.clone()
+        for _ in range(self.n_steps):
+            L = self._laplacian(E)  # (B,N,N)
+            # diffusion term: symmetrized Laplacian action
+            diffusion = -0.5 * (torch.matmul(L, E) + torch.matmul(E, L))
+            # decay term
+            decay = - gamma * E
+            # residual correction (learned)
+            if H_t is None:
+                # create placeholder node embeddings by averaging adjacency rows
+                H_fake = E.mean(dim=-1, keepdim=True).repeat(1, 1, self.node_dim)
+            else:
+                H_fake = H_t
+
+            residual = self.residual(E, H_fake, z_t)  # (B,N,N)
+            dE = kappa * diffusion + decay + residual
+            E = E + (self.dt / float(self.n_steps)) * dE
+            # keep symmetric and non-negative
+            E = 0.5 * (E + E.transpose(1, 2))
+            E = torch.clamp(E, min=0.0)
+            # renormalize per-batch to keep numerical stability
+            maxv = E.view(B, -1).max(dim=-1)[0].view(B, 1, 1).clamp(min=1e-12)
+            E = E / maxv
+
+        E = _postprocess_adj(E, mask_diagonal=False)
+        return E
+
+    def compute_residual(self, E: torch.Tensor, H: Optional[torch.Tensor], z: torch.Tensor) -> torch.Tensor:
+        """Return the learned residual R(E,H,z) without integrating dynamics."""
+        if H is None:
+            H_fake = E.mean(dim=-1, keepdim=True).repeat(1, 1, self.node_dim)
+        else:
+            H_fake = H
+        return self.residual(E, H_fake, z)
+
+    def get_params_from_covariates(self, covariates: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.param_net(covariates)
+
+
+class PersonalizedSDEEvolution(nn.Module):
+    """Stochastic evolution: personalized drift (biophysical + learned residual) and diffusion noise scaled by covariates.
+
+    Integrates using Euler-Maruyama.
+    """
+    def __init__(self, node_dim: int, latent_dim: int, cov_dim: int = 3, residual_hidden: int = 128, n_steps: int = 12, dt: float = 1.0):
+        super().__init__()
+        self.node_dim = node_dim
+        self.latent_dim = latent_dim
+        self.n_steps = int(max(1, n_steps))
+        self.dt = float(dt)
+        self.param_net = CovariateParamNet(cov_dim, hidden=32)
+        # residual drift
+        self.residual = PerEdgeMLP(node_dim=node_dim, latent_dim=latent_dim, hidden_dim=residual_hidden, mask_diagonal=True)
+
+    def _laplacian(self, A: torch.Tensor) -> torch.Tensor:
+        deg = torch.sum(A, dim=-1)
+        D = torch.zeros_like(A)
+        idx = torch.arange(A.size(-1), device=A.device)
+        D[:, idx, idx] = deg
+        return D - A
+
+    def forward(self, E_t: torch.Tensor, H_t: Optional[torch.Tensor], z_t: torch.Tensor, covariates: Optional[torch.Tensor] = None, t_span: Optional[torch.Tensor] = None) -> torch.Tensor:
+        B, N, _ = E_t.shape
+        device = E_t.device
+
+        if covariates is None:
+            covariates = torch.zeros(B, 3, device=device, dtype=E_t.dtype)
+        kappa, gamma, sigma = self.param_net(covariates)  # (B,1)
+        kappa = kappa.view(B, 1, 1)
+        gamma = gamma.view(B, 1, 1)
+        sigma = sigma.view(B, 1, 1)
+
+        E = E_t.clone()
+        sqrt_dt = math.sqrt(self.dt / max(1, self.n_steps))
+        for _ in range(self.n_steps):
+            L = self._laplacian(E)
+            diffusion = -0.5 * (torch.matmul(L, E) + torch.matmul(E, L))
+            decay = - gamma * E
+
+            if H_t is None:
+                H_fake = E.mean(dim=-1, keepdim=True).repeat(1, 1, self.node_dim)
+            else:
+                H_fake = H_t
+
+            drift_resid = self.residual(E, H_fake, z_t)
+            drift = kappa * diffusion + decay + drift_resid
+
+            noise = torch.randn_like(E) * sigma
+            E = E + (self.dt / float(self.n_steps)) * drift + sqrt_dt * noise
+            E = 0.5 * (E + E.transpose(1, 2))
+            E = torch.clamp(E, min=0.0)
+            maxv = E.view(B, -1).max(dim=-1)[0].view(B, 1, 1).clamp(min=1e-12)
+            E = E / maxv
+
+        E = _postprocess_adj(E, mask_diagonal=False)
+        return E
+
+    def compute_residual(self, E: torch.Tensor, H: Optional[torch.Tensor], z: torch.Tensor) -> torch.Tensor:
+        if H is None:
+            H_fake = E.mean(dim=-1, keepdim=True).repeat(1, 1, self.node_dim)
+        else:
+            H_fake = H
+        return self.residual(E, H_fake, z)
+
+    def get_params_from_covariates(self, covariates: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.param_net(covariates)
+
+
+class StructuralCausalModel:
+    """Lightweight SCM on node-level pathology loads enabling do()-interventions and counterfactual rollouts.
+
+    - The SCM represents node values X (B,N) evolving by linear SEM:
+        X = phi * A_norm @ X + b + noise
+      This is intentionally simple yet sufficient to run do()-style interventions and compute counterfactuals for attribution.
+    """
+    def __init__(self, num_nodes: int, phi: float = 0.6, bias: float = 0.01, noise_scale: float = 0.01):
+        self.num_nodes = num_nodes
+        self.phi = float(phi)
+        self.bias = float(bias)
+        self.noise_scale = float(noise_scale)
+
+    def step(self, X: np.ndarray, A: np.ndarray) -> np.ndarray:
+        # X: (N,) or (B,N), A: (N,N) or (B,N,N)
+        if X.ndim == 1:
+            X = X[None, :]
+            single = True
+        else:
+            single = False
+        B = X.shape[0]
+        if A.ndim == 2:
+            A = np.tile(A[None, :, :], (B, 1, 1))
+        # normalize adjacency rows
+        row_sums = A.sum(axis=-1, keepdims=True)
+        A_norm = np.divide(A, (row_sums + 1e-12))
+        X_next = self.phi * (A_norm @ X[..., None]).squeeze(-1) + self.bias + self.noise_scale * np.random.randn(*X.shape)
+        if single:
+            return X_next[0]
+        return X_next
+
+    def do_intervention(self, X: np.ndarray, do_pairs: List[Tuple[int, float]]) -> np.ndarray:
+        # apply hard setting of node values
+        X_cf = X.copy()
+        for (i, val) in do_pairs:
+            X_cf[..., i] = val
+        return X_cf
+
+    def counterfactual_rollout(self, X0: np.ndarray, A_seq: List[np.ndarray], do_pairs: Optional[List[Tuple[int, float]]] = None) -> np.ndarray:
+        # X0: (N,) initial state, A_seq: list of adjacency matrices over time
+        X = X0.copy()
+        if do_pairs is not None:
+            X = self.do_intervention(X, do_pairs)
+        traj = [X.copy()]
+        for A in A_seq:
+            X = self.step(X, A)
+            traj.append(X.copy())
+        return np.stack(traj, axis=0)  # (T+1, N)
+
+
+class GraphTransformer(nn.Module):
+    """Graph Transformer with disease-state modulated attention."""
+
+    def __init__(self, node_dim: int, latent_dim: Optional[int] = None, num_heads: int = 4):
+        super().__init__()
+        self.node_dim = node_dim
+        self.latent_dim = latent_dim
+        self.num_heads = num_heads
+
+        if node_dim % num_heads != 0:
+            raise ValueError(f"node_dim {node_dim} must be divisible by num_heads {num_heads}")
+
+        self.head_dim = node_dim // num_heads
+
+        self.query_proj = nn.Linear(node_dim, node_dim)
+        self.key_proj = nn.Linear(node_dim, node_dim)
+        self.value_proj = nn.Linear(node_dim, node_dim)
+        self.out_proj = nn.Linear(node_dim, node_dim)
+
+        self.norm = nn.LayerNorm(node_dim)
+        self.feed_forward = nn.Sequential(
+            nn.Linear(node_dim, node_dim * 2),
+            nn.ReLU(),
+            nn.Linear(node_dim * 2, node_dim)
+        )
+
+        # Disease state modulation of attention
+        if latent_dim is not None:
+            self.latent_to_attention_scale = nn.Sequential(
+                nn.Linear(latent_dim, 64),
+                nn.ReLU(),
+                nn.Linear(64, num_heads),
+                nn.Softplus()  # Ensure positive scaling
+            )
+
+    def forward(
+        self,
+        node_embeddings: torch.Tensor,
+        adjacency_matrix: Optional[torch.Tensor] = None,
+        latent_state: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        batch_size, num_nodes, _ = node_embeddings.shape
+
+        # Calculate Q, K, V
+        queries = self.query_proj(node_embeddings).view(batch_size, num_nodes, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        keys = self.key_proj(node_embeddings).view(batch_size, num_nodes, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        values = self.value_proj(node_embeddings).view(batch_size, num_nodes, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        # Scaled Dot-Product Attention
+        scores = torch.matmul(queries, keys.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B, h, N, N)
+
+        # Modulate attention with disease state
+        if latent_state is not None and self.latent_dim is not None:
+            latent_scales = self.latent_to_attention_scale(latent_state)  # (B, num_heads)
+            scores = scores * latent_scales.view(batch_size, self.num_heads, 1, 1)
+
+        # If adjacency provided, mask out non-edges to prevent attention across absent edges
+        if adjacency_matrix is not None:
+            # adjacency_matrix: (B, N, N) -> mask where zero/negative entries should be masked
+            mask = (adjacency_matrix > 0).unsqueeze(1)  # (B,1,N,N)
+            neg_inf = -9e15
+            scores = torch.where(mask, scores, torch.full_like(scores, neg_inf))
+
+        attention_weights = torch.softmax(scores, dim=-1)
+
+        context = torch.matmul(attention_weights, values)  # (B, h, N, d_k)
+        context = context.permute(0, 2, 1, 3).contiguous().view(batch_size, num_nodes, self.node_dim)
+
+        output = self.out_proj(context)
+
+        # Residual + Norm + Feed Forward
+        output = self.norm(output + node_embeddings)
+        output = self.feed_forward(output) + output
+
+        # produce averaged per-edge importance across heads
+        edge_importance = attention_weights.mean(dim=1)  # (B, N, N)
+        return output, attention_weights, edge_importance
+
+class EdgeDecoder(nn.Module):
+    # Decodes edge weights from node embeddings and latent state.
+
+    def __init__(self, node_dim: int, latent_dim: int, mask_diagonal: bool = True):
+        super().__init__()
+        self.readout = nn.Sequential(
+            nn.Linear(2 * node_dim + latent_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 1)
+        )
+        self.mask_diagonal = mask_diagonal
+
+    def forward(self, node_embeddings: torch.Tensor, latent_state: torch.Tensor) -> torch.Tensor:
+        batch_size, num_nodes, embedding_dim = node_embeddings.shape
+
+        h_i = node_embeddings.unsqueeze(2).expand(batch_size, num_nodes, num_nodes, embedding_dim)
+        h_j = node_embeddings.unsqueeze(1).expand(batch_size, num_nodes, num_nodes, embedding_dim)
+        z_expanded = latent_state.view(batch_size, 1, 1, -1).expand(batch_size, num_nodes, num_nodes, latent_state.size(-1))
+
+        inputs = torch.cat([h_i, h_j, z_expanded], dim=-1)
+        output = self.readout(inputs).squeeze(-1)
+        output = _postprocess_adj(output, mask_diagonal=self.mask_diagonal)
+        return output
+
+
+class LowRankEdgeDecoder(nn.Module):
+    """Parameter-efficient low-rank edge decoder: predict adjacency as U V^T where U,V are node embeddings projected from node features and latent z.
+
+    This reduces parameters from O(N^2) to O(N r) for rank r.
+    """
+    def __init__(self, node_dim: int, latent_dim: int, rank: int = 8, mask_diagonal: bool = True):
+        super().__init__()
+        self.rank = rank
+        self.mask_diagonal = mask_diagonal
+        self.left_proj = nn.Linear(node_dim + latent_dim, rank)
+        self.right_proj = nn.Linear(node_dim + latent_dim, rank)
+
+    def forward(self, node_embeddings: torch.Tensor, latent_state: torch.Tensor) -> torch.Tensor:
+        # node_embeddings: (B,N,D), latent_state: (B,L)
+        B, N, D = node_embeddings.shape
+        z_exp = latent_state.view(B, 1, -1).expand(B, N, latent_state.size(-1))
+        inp = torch.cat([node_embeddings, z_exp], dim=-1)  # (B,N,D+L)
+        U = self.left_proj(inp)  # (B,N,r)
+        V = self.right_proj(inp)  # (B,N,r)
+        # adjacency approx: U @ V^T per-batch
+        A = torch.matmul(U, V.transpose(1, 2))  # (B,N,N)
+        A = _postprocess_adj(A, mask_diagonal=self.mask_diagonal)
+        return A
+
+
+class ClinicalDecoder(nn.Module):
+    """Predicts clinical scores (e.g., MMSE) from graph embeddings and latent state."""
+
+    def __init__(self, node_dim: int, latent_dim: int, out_dim: int = 1):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(node_dim + (latent_dim or 0), 64),
+            nn.ReLU(),
+            nn.Linear(64, out_dim)
+        )
+
+    def forward(self, node_embeddings: torch.Tensor, latent_state: Optional[torch.Tensor]) -> torch.Tensor:
+        # node_embeddings: (B, N, D)
+        B = node_embeddings.size(0)
+        # Pool node embeddings to get graph representation (mean pooling)
+        graph_embedding = node_embeddings.mean(dim=1)  # (B, D)
+        if latent_state is None:
+            # if no latent provided, use zeros
+            latent_state = torch.zeros(B, 0, device=graph_embedding.device, dtype=graph_embedding.dtype)
+        # Ensure latent_state has the right 2D shape
+        if latent_state.dim() == 1:
+            latent_state = latent_state.unsqueeze(0)
+        # If latent has zero dim, simply use graph_embedding
+        if latent_state.size(-1) == 0:
+            inp = graph_embedding
+        else:
+            # concat graph embedding with latent
+            # If latent dimension doesn't match batch dims, broadcast or reshape
+            if latent_state.size(0) != B:
+                # try to expand
+                latent_state = latent_state.expand(B, -1)
+            inp = torch.cat([graph_embedding, latent_state], dim=-1)
+        out = self.mlp(inp)
+        return out  # (B, out_dim)
+
+class _ODEFuncDecoder(nn.Module):
+    """Simple MLP vector field for ODE reconstructor."""
+    def __init__(self, hidden_dim: int, node_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh()
+        )
+
+    def forward(self, t, h):
+        return self.net(h)
+
+
+class VAEODEReconstructor(nn.Module):
+    """ODE-based decoder that integrates a latent initial state to produce temporal context
+    and decodes to node-feature sequences.
+
+    If `torchdiffeq.odeint` is not available at runtime, this class will fall back to the
+    RNN-based `VAEReconstructor` behavior for robustness in environments without the
+    optional dependency.
+    """
+    def __init__(self, latent_dim: int, node_dim: int, out_feats: int = 4, hidden: int = 128, T_out: int = 6, ode_solver: str = 'rk4'):
+        super().__init__()
+        self.T_out = T_out
+        self.out_feats = out_feats
+        self.node_dim = node_dim
+        self.hidden = hidden
+        self.ode_solver = ode_solver
+
+        # projection z -> initial hidden for ODE
+        self.z_to_h0 = nn.Linear(latent_dim, hidden)
+        # ODE func
+        self.func = _ODEFuncDecoder(hidden, node_dim)
+
+        # learned node template
+        self.node_template = nn.Parameter(torch.randn(1, node_dim))
+
+        # readout from ODE hidden + node template to node features
+        self.readout = nn.Sequential(
+            nn.Linear(hidden + node_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, out_feats)
+        )
+
+        # fallback RNN decoder for environments without torchdiffeq
+        self._fallback = VAEReconstructor(latent_dim, node_dim, out_feats=out_feats, hidden=hidden, T_out=T_out)
+
+    def forward(self, z: torch.Tensor, num_nodes: int) -> torch.Tensor:
+        # Try to use torchdiffeq. If not available, fall back to RNN reconstructor.
+        try:
+            from torchdiffeq import odeint
+        except Exception:
+            return self._fallback(z, num_nodes)
+
+        B = z.size(0)
+        device = z.device
+        h0 = self.z_to_h0(z)  # (B, hidden)
+
+        # integrate over normalized time [0,1] at T_out points
+        t = torch.linspace(0.0, 1.0, self.T_out, device=device)
+        # odeint expects (B, hidden) as initial, but returns (T, B, hidden) when batch_first False
+        h0_batch = h0
+        try:
+            H = odeint(self.func, h0_batch, t, method=self.ode_solver)  # (T, B, hidden)
+        except Exception:
+            # try with default solver
+            H = odeint(self.func, h0_batch, t)
+
+        # permute to (B, T, hidden)
+        H = H.permute(1, 0, 2)
+
+        # expand node template per timestep and decode
+        node_tmpl = self.node_template.unsqueeze(0).unsqueeze(0).expand(B, self.T_out, -1).to(device)  # (B,T,node_dim)
+        concat = torch.cat([H, node_tmpl], dim=-1)  # (B,T,hidden+node_dim)
+        step_feat = self.readout(concat)  # (B,T,out_feats)
+        step_feat = step_feat.unsqueeze(2).expand(B, self.T_out, num_nodes, self.out_feats)
+        return step_feat
+
+class CovariateParamNet(nn.Module):
+    """Map subject covariates to positive dynamical scalars (kappa, gamma, sigma)."""
+    def __init__(self, cov_dim: int, hidden: int = 32, eps: float = 1e-6):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(cov_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 3)
+        )
+        self.softplus = nn.Softplus()
+        self.eps = eps
+
+    def forward(self, covariates: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # covariates: (B, C) -> return (kappa, gamma, sigma) each (B,1)
+        out = self.net(covariates)
+        out = self.softplus(out) + self.eps
+        kappa = out[:, 0:1]
+        gamma = out[:, 1:2]
+        sigma = out[:, 2:3]
+        return kappa, gamma, sigma
+
+
+class BiophysicalDiffusionEvolution(nn.Module):
+    """Deterministic biophysical diffusion prior on adjacency matrices.
+
+    - Implements simple graph diffusion dynamics on adjacency matrices:
+        dE/dt = -kappa * (L E + E L) / 2 - gamma * E + R(E, H, z)
+      where L is graph Laplacian of E (symmetric), and R is a learnable residual (PerEdgeMLP) to capture non-biophysical effects.
+
+    - Integration done with simple forward-Euler steps for robustness if torchdiffeq missing.
+    - kappa/gamma are provided per-subject via covariates using CovariateParamNet.
+    """
+    def __init__(self, node_dim: int, latent_dim: int, cov_dim: int = 3, residual_hidden: int = 128, n_steps: int = 8, dt: float = 1.0):
+        super().__init__()
+        self.node_dim = node_dim
+        self.latent_dim = latent_dim
+        self.n_steps = int(max(1, n_steps))
+        self.dt = float(dt)
+        self.param_net = CovariateParamNet(cov_dim, hidden=32)
+        # residual model operates per-edge and returns correction to adjacency
+        self.residual = PerEdgeMLP(node_dim=node_dim, latent_dim=latent_dim, hidden_dim=residual_hidden, mask_diagonal=True)
+
+    def _laplacian(self, A: torch.Tensor) -> torch.Tensor:
+        # A: (B,N,N) -> L = D - A, computed per-batch
+        deg = torch.sum(A, dim=-1)  # (B,N)
+        D = torch.zeros_like(A)
+        idx = torch.arange(A.size(-1), device=A.device)
+        D[:, idx, idx] = deg
+        L = D - A
+        return L
+
+    def forward(self, E_t: torch.Tensor, H_t: Optional[torch.Tensor], z_t: torch.Tensor, covariates: Optional[torch.Tensor] = None, t_span: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            E_t: (B,N,N) current adjacency
+            H_t: (B,N,D) node embeddings (optional)
+            z_t: (B, latent_dim) subject latent
+            covariates: (B, cov_dim) subject covariates (APOE, CSF, etc.)
+        Returns:
+            E_next: (B,N,N) evolved adjacency after integration window
+        """
+        B, N, _ = E_t.shape
+        device = E_t.device
+
+        if covariates is None:
+            # default neutral covariates
+            covariates = torch.zeros(B, 3, device=device, dtype=E_t.dtype)
+
+        kappa, gamma, _ = self.param_net(covariates)  # (B,1)
+        # broadcast scalars
+        kappa = kappa.view(B, 1, 1)
+        gamma = gamma.view(B, 1, 1)
+
+        E = E_t.clone()
+        for _ in range(self.n_steps):
+            L = self._laplacian(E)  # (B,N,N)
+            # diffusion term: symmetrized Laplacian action
+            diffusion = -0.5 * (torch.matmul(L, E) + torch.matmul(E, L))
+            # decay term
+            decay = - gamma * E
+            # residual correction (learned)
+            if H_t is None:
+                # create placeholder node embeddings by averaging adjacency rows
+                H_fake = E.mean(dim=-1, keepdim=True).repeat(1, 1, self.node_dim)
+            else:
+                H_fake = H_t
+
+            residual = self.residual(E, H_fake, z_t)  # (B,N,N)
+            dE = kappa * diffusion + decay + residual
+            E = E + (self.dt / float(self.n_steps)) * dE
+            # keep symmetric and non-negative
+            E = 0.5 * (E + E.transpose(1, 2))
+            E = torch.clamp(E, min=0.0)
+            # renormalize per-batch to keep numerical stability
+            maxv = E.view(B, -1).max(dim=-1)[0].view(B, 1, 1).clamp(min=1e-12)
+            E = E / maxv
+
+        E = _postprocess_adj(E, mask_diagonal=False)
+        return E
+
+
+class PersonalizedSDEEvolution(nn.Module):
+    """Stochastic evolution: personalized drift (biophysical + learned residual) and diffusion noise scaled by covariates.
+
+    Integrates using Euler-Maruyama.
+    """
+    def __init__(self, node_dim: int, latent_dim: int, cov_dim: int = 3, residual_hidden: int = 128, n_steps: int = 12, dt: float = 1.0):
+        super().__init__()
+        self.node_dim = node_dim
+        self.latent_dim = latent_dim
+        self.n_steps = int(max(1, n_steps))
+        self.dt = float(dt)
+        self.param_net = CovariateParamNet(cov_dim, hidden=32)
+        # residual drift
+        self.residual = PerEdgeMLP(node_dim=node_dim, latent_dim=latent_dim, hidden_dim=residual_hidden, mask_diagonal=True)
+
+    def _laplacian(self, A: torch.Tensor) -> torch.Tensor:
+        deg = torch.sum(A, dim=-1)
+        D = torch.zeros_like(A)
+        idx = torch.arange(A.size(-1), device=A.device)
+        D[:, idx, idx] = deg
+        return D - A
+
+    def forward(self, E_t: torch.Tensor, H_t: Optional[torch.Tensor], z_t: torch.Tensor, covariates: Optional[torch.Tensor] = None, t_span: Optional[torch.Tensor] = None) -> torch.Tensor:
+        B, N, _ = E_t.shape
+        device = E_t.device
+
+        if covariates is None:
+            covariates = torch.zeros(B, 3, device=device, dtype=E_t.dtype)
+        kappa, gamma, sigma = self.param_net(covariates)  # (B,1)
+        kappa = kappa.view(B, 1, 1)
+        gamma = gamma.view(B, 1, 1)
+        sigma = sigma.view(B, 1, 1)
+
+        E = E_t.clone()
+        sqrt_dt = math.sqrt(self.dt / max(1, self.n_steps))
+        for _ in range(self.n_steps):
+            L = self._laplacian(E)
+            diffusion = -0.5 * (torch.matmul(L, E) + torch.matmul(E, L))
+            decay = - gamma * E
+
+            if H_t is None:
+                H_fake = E.mean(dim=-1, keepdim=True).repeat(1, 1, self.node_dim)
+            else:
+                H_fake = H_t
+
+            drift_resid = self.residual(E, H_fake, z_t)
+            drift = kappa * diffusion + decay + drift_resid
+
+            noise = torch.randn_like(E) * sigma
+            E = E + (self.dt / float(self.n_steps)) * drift + sqrt_dt * noise
+            E = 0.5 * (E + E.transpose(1, 2))
+            E = torch.clamp(E, min=0.0)
+            maxv = E.view(B, -1).max(dim=-1)[0].view(B, 1, 1).clamp(min=1e-12)
+            E = E / maxv
+
+        E = _postprocess_adj(E, mask_diagonal=False)
+        return E
+
+
+class StructuralCausalModel:
+    """Lightweight SCM on node-level pathology loads enabling do()-interventions and counterfactual rollouts.
+
+    - The SCM represents node values X (B,N) evolving by linear SEM:
+        X = phi * A_norm @ X + b + noise
+      This is intentionally simple yet sufficient to run do()-style interventions and compute counterfactuals for attribution.
+    """
+    def __init__(self, num_nodes: int, phi: float = 0.6, bias: float = 0.01, noise_scale: float = 0.01):
+        self.num_nodes = num_nodes
+        self.phi = float(phi)
+        self.bias = float(bias)
+        self.noise_scale = float(noise_scale)
+
+    def step(self, X: np.ndarray, A: np.ndarray) -> np.ndarray:
+        # X: (N,) or (B,N), A: (N,N) or (B,N,N)
+        if X.ndim == 1:
+            X = X[None, :]
+            single = True
+        else:
+            single = False
+        B = X.shape[0]
+        if A.ndim == 2:
+            A = np.tile(A[None, :, :], (B, 1, 1))
+        # normalize adjacency rows
+        row_sums = A.sum(axis=-1, keepdims=True)
+        A_norm = np.divide(A, (row_sums + 1e-12))
+        X_next = self.phi * (A_norm @ X[..., None]).squeeze(-1) + self.bias + self.noise_scale * np.random.randn(*X.shape)
+        if single:
+            return X_next[0]
+        return X_next
+
+    def do_intervention(self, X: np.ndarray, do_pairs: List[Tuple[int, float]]) -> np.ndarray:
+        # apply hard setting of node values
+        X_cf = X.copy()
+        for (i, val) in do_pairs:
+            X_cf[..., i] = val
+        return X_cf
+
+    def counterfactual_rollout(self, X0: np.ndarray, A_seq: List[np.ndarray], do_pairs: Optional[List[Tuple[int, float]]] = None) -> np.ndarray:
+        # X0: (N,) initial state, A_seq: list of adjacency matrices over time
+        X = X0.copy()
+        if do_pairs is not None:
+            X = self.do_intervention(X, do_pairs)
+        traj = [X.copy()]
+        for A in A_seq:
+            X = self.step(X, A)
+            traj.append(X.copy())
+        return np.stack(traj, axis=0)  # (T+1, N)
+
+
+# ---------------------- DDGModel: assemble everything ----------------------
+
+class DDGModel(nn.Module):
+    """
+    Dynamic Disease Graph Model (DDG).
+
+    Combines graph encoding, latent trajectory modeling, and edge evolution to forecast
+    disease progression in brain networks.
+    """
+
+    def __init__(
+        self,
+        in_feats: int = 3,
+        node_dim: int = 32,
+        latent_dim: int = 16,
+        use_edge_gru: bool = False,
+        use_gde: bool = False,
+        use_adaptive_edges: bool = False,
+        alpha_init: float = 0.5,
+        use_vae: bool = False,
+        kl_beta: float = 1.0,
+        use_vae_recon: bool = False,
+        recon_T: int = 6,
+        use_ode_recon: bool = False,
+        use_stage_conditioned: bool = False,
+        num_stages: int = 3
+    ):
+        super().__init__()
+        # ... the rest of __init__ as in your file (no change) ...
+        self.encoder = GraphEncoder(in_feats, node_dim)
+        self.use_vae = use_vae
+        self.kl_beta = float(kl_beta)
+        if self.use_vae:
+            self.z_encoder = VAEZEncoder(node_dim, latent_dim)
+        else:
+            self.z_encoder = ZEncoderGRU(node_dim, latent_dim)
+        self.use_vae_recon = use_vae_recon
+        self.use_ode_recon = use_ode_recon
+        if self.use_vae_recon:
+            if self.use_ode_recon:
+                self.reconstructor = VAEODEReconstructor(latent_dim, node_dim, out_feats=in_feats, T_out=recon_T)
+            else:
+                self.reconstructor = VAEReconstructor(latent_dim, node_dim, out_feats=in_feats, T_out=recon_T)
+        self.transformer = GraphTransformer(node_dim, latent_dim=latent_dim, num_heads=4)
+        # ... rest of initialization identical to your original file ...
+        self.use_edge_gru = use_edge_gru
+        self.use_gde = use_gde and _HAS_TORCHDIFFEQ
+        self.use_adaptive_edges = use_adaptive_edges
+        self.use_stage_conditioned = use_stage_conditioned
+        self.num_stages = num_stages
+        self.use_biophysical_prior = False
+        self.use_personalized_sde = False
+
+        if self.use_adaptive_edges:
+            self.edge_generator = EdgeGenerator(node_dim=node_dim, latent_dim=latent_dim)
+            self._alpha_param = nn.Parameter(torch.tensor(float(alpha_init)))
+            self._multimodal_logits = nn.Parameter(torch.tensor([0.6, 0.2, 0.2], dtype=torch.float32))
+            self.importance_head = ImportanceHead(node_dim)
+
+        if use_edge_gru:
+            self.evolution = EdgeGRU(node_dim, latent_dim, hidden_dim=64)
+        else:
+            if self.use_personalized_sde:
+                self.evolution = PersonalizedSDEEvolution(node_dim, latent_dim, cov_dim=3, residual_hidden=128)
+            elif self.use_biophysical_prior:
+                self.evolution = BiophysicalDiffusionEvolution(node_dim, latent_dim, cov_dim=3, residual_hidden=128)
+            elif self.use_gde:
+                if self.use_stage_conditioned and 'GraphGDEEvolution' in globals():
+                    self.evolution = GraphGDEStageEvolution(node_dim, latent_dim, num_stages=num_stages)
+                else:
+                    # fallback: if GraphGDEEvolution not available, use PerEdgeMLP
+                    self.evolution = PerEdgeMLP(node_dim, latent_dim, hidden_dim=128)
+            else:
+                self.evolution = PerEdgeMLP(node_dim, latent_dim, hidden_dim=128)
+
+        self.edge_decoder = EdgeDecoder(node_dim, latent_dim)
+        self.clinical_decoder = ClinicalDecoder(node_dim, latent_dim)
+
+        self.node_dim = node_dim
+        self.latent_dim = latent_dim
+        self.scm = None
+
+    # Helpers to enable biophysical / personalized SDE at runtime (backwards-compatible)
+    def enable_biophysical_prior(self, covariate_dim: int = 3, residual_hidden: int = 128, n_steps: int = 8):
+        self.use_biophysical_prior = True
+        self.use_personalized_sde = False
+        self.evolution = BiophysicalDiffusionEvolution(self.node_dim, self.latent_dim, cov_dim=covariate_dim, residual_hidden=residual_hidden, n_steps=n_steps)
+
+    def enable_personalized_sde(self, covariate_dim: int = 3, residual_hidden: int = 128, n_steps: int = 12):
+        self.use_personalized_sde = True
+        self.use_biophysical_prior = False
+        self.evolution = PersonalizedSDEEvolution(self.node_dim, self.latent_dim, cov_dim=covariate_dim, residual_hidden=residual_hidden, n_steps=n_steps)
+
+    def attach_structural_causal_model(self, scm: StructuralCausalModel):
+        self.scm = scm
+
+    def run_counterfactual(self, X0: Union[np.ndarray, torch.Tensor], A_seq: List[Union[np.ndarray, torch.Tensor]], do_pairs: Optional[List[Tuple[int, float]]] = None) -> np.ndarray:
+        """Run counterfactual rollout using the attached StructuralCausalModel.
+
+        Args:
+            X0: initial node values (N,) or (B,N)
+            A_seq: list of adjacency matrices over time (numpy or torch)
+            do_pairs: optional list of (node_index, value) interventions
+
+        Returns:
+            np.ndarray trajectory of shape (T+1, N) or (B, T+1, N)
+        """
+        if self.scm is None:
+            raise RuntimeError('No StructuralCausalModel attached; call attach_structural_causal_model() first')
+
+        # convert X0 and A_seq to numpy
+        if isinstance(X0, torch.Tensor):
+            X0_np = X0.detach().cpu().numpy()
+        else:
+            X0_np = np.asarray(X0)
+
+        A_seq_np = []
+        for A in A_seq:
+            if isinstance(A, torch.Tensor):
+                A_seq_np.append(A.detach().cpu().numpy())
+            else:
+                A_seq_np.append(np.asarray(A))
+
+        traj = self.scm.counterfactual_rollout(X0_np, A_seq_np, do_pairs=do_pairs)
+        return traj
+
+    def synthesize_adjacency_sequence(self,
+                                      initial_adj: torch.Tensor,
+                                      node_embeddings_seq: Optional[List[torch.Tensor]] = None,
+                                      latent_seq: Optional[List[torch.Tensor]] = None,
+                                      covariates_seq: Optional[List[torch.Tensor]] = None,
+                                      steps: int = 4) -> List[torch.Tensor]:
+        """Produce a sequence of adjacency matrices by repeatedly applying the evolution module.
+
+        Args:
+            initial_adj: (B,N,N) starting adjacency
+            node_embeddings_seq: optional list length >= steps of (B,N,D) node embeddings
+            latent_seq: optional list length >= steps of (B,latent_dim)
+            covariates_seq: optional list length >= steps of (B,cov_dim)
+            steps: number of steps to roll out
+
+        Returns:
+            list of adjacency tensors length `steps` (each (B,N,N))
+        """
+        A = initial_adj
+        seq = []
+        for t in range(steps):
+            H_t = node_embeddings_seq[t] if (node_embeddings_seq is not None and t < len(node_embeddings_seq)) else None
+            z_t = latent_seq[t] if (latent_seq is not None and t < len(latent_seq)) else None
+            cov_t = covariates_seq[t] if (covariates_seq is not None and t < len(covariates_seq)) else None
+            with torch.no_grad():
+                # ensure latent present for evolutions that expect it
+                if z_t is None:
+                    z_t = torch.zeros(A.size(0), self.latent_dim, device=A.device, dtype=A.dtype)
+                try:
+                    A_next = self.evolution(A, H_t, z_t, cov_t)
+                except TypeError:
+                    A_next = self.evolution(A, H_t, z_t)
+            seq.append(A_next)
+            A = A_next
+        return seq
+
+    def compute_mechanistic_loss(self,
+                                 E_t: torch.Tensor,
+                                 H_t: Optional[torch.Tensor],
+                                 z_t: torch.Tensor,
+                                 covariates: Optional[torch.Tensor] = None,
+                                 target_adj: Optional[torch.Tensor] = None,
+                                 residual_weight: float = 1.0,
+                                 param_weight: float = 0.1) -> Dict[str, torch.Tensor]:
+        """Compute regularization losses encouraging small learned residuals and interpretable params.
+
+        Returns dict with keys: 'residual_l2', 'param_l2', 'total'
+        """
+        losses: Dict[str, torch.Tensor] = {}
+        # compute residual
+        if hasattr(self.evolution, 'compute_residual'):
+            residual = self.evolution.compute_residual(E_t, H_t, z_t)
+            residual_l2 = residual.pow(2).mean()
+        else:
+            residual_l2 = torch.tensor(0.0, device=E_t.device)
+
+        # parameter regularization if available
+        if hasattr(self.evolution, 'get_params_from_covariates') and covariates is not None:
+            kappa, gamma, sigma = self.evolution.get_params_from_covariates(covariates)
+            param_l2 = (kappa.pow(2).mean() + gamma.pow(2).mean())
+        else:
+            param_l2 = torch.tensor(0.0, device=E_t.device)
+
+        total = residual_weight * residual_l2 + param_weight * param_l2
+        # optional adjacency reconstruction loss
+        if target_adj is not None:
+            recon_l2 = F.mse_loss(self.evolution(E_t, H_t, z_t, covariates), target_adj)
+            total = total + 0.5 * recon_l2
+            losses['recon_l2'] = recon_l2
+
+        losses['residual_l2'] = residual_l2
+        losses['param_l2'] = param_l2
+        losses['total'] = total
+        return losses
+    
+    def forward(self,
+                node_features: torch.Tensor,
+                adjacency_matrices: Optional[torch.Tensor] = None,
+                adj_components: Optional[Dict[str, torch.Tensor]] = None,
+                rollout_steps: int = 1,
+                teacher_forcing_prob: float = 1.0,
+                covariates: Optional[torch.Tensor] = None) -> Union[List[Dict[str, Any]], Tuple[List[Dict[str, Any]], torch.Tensor], Tuple[List[Dict[str, Any]], torch.Tensor, torch.Tensor]]:
+        """
+        Simple, robust forward used by older training scripts.
+
+        Args:
+            node_features: (B, T, N, F) tensor
+            adjacency_matrices: optional (B, T, N, N) tensor (if available)
+            adj_components: optional multimodal components dict (not required here)
+            rollout_steps: how many future steps to predict
+            teacher_forcing_prob: ignored in this simplified forward
+            covariates: optional (B, cov_dim) subject covariates
+
+        Returns:
+            outputs: list of dicts (length rollout_steps) with keys:
+                - 'predicted_adjacency' : (B, N, N)
+                - 'evolved_adjacency' : (B, N, N)
+                - 'predicted_score' : (B, 1)
+                - 'latent_state' : (B, latent_dim)
+                - 'attention_weights' : optional attention tensor
+                - 'PA', 'PX' if available
+            Optionally also returns latent_sequence (B, T, latent_dim) and recon if reconstructor enabled.
+        """
+        # validate input dims
+        if node_features.dim() != 4:
+            raise ValueError("node_features must be (B, T, N, F)")
+
+        B, T, N, F = node_features.shape
+        device = node_features.device
+
+        # encode each timepoint with encoder -> produce node_embeddings_seq (B, T, N, D)
+        emb_list = []
+        attn_list = []
+        for t in range(T):
+            x_t = node_features[:, t]  # (B, N, F)
+            A_t = None
+            if adjacency_matrices is not None and adjacency_matrices.dim() == 4:
+                A_t = adjacency_matrices[:, t]
+            try:
+                h_t = self.encoder(x_t, A_t)  # (B, N, D)
+            except Exception:
+                # fallback: encoder may expect (B,N,F) without adjacency
+                h_t = self.encoder(x_t, None)
+            emb_list.append(h_t)
+        node_embeddings_seq = torch.stack(emb_list, dim=1)  # (B, T, N, D)
+
+        # compute latent (either VAE z or deterministic z)
+        if self.use_vae:
+            # VAE-style z encoding returns (z, mu, logvar)
+            try:
+                z, mu, logvar = self.z_encoder(node_embeddings_seq)
+                latent_state = z
+                latent_sequence = latent_state.unsqueeze(1).expand(B, T, -1)
+            except Exception:
+                # If signature differs, fallback to deterministic GRU encoder
+                latent_state = self.z_encoder(node_embeddings_seq)
+                latent_sequence = latent_state.unsqueeze(1).expand(B, T, -1)
+                mu = None; logvar = None
+        else:
+            latent_state = self.z_encoder(node_embeddings_seq)
+            latent_sequence = latent_state.unsqueeze(1).expand(B, T, -1)
+            mu = None; logvar = None
+
+        # choose initial adjacency to evolve: use last observed if present else derive from last embeddings
+        if adjacency_matrices is not None and adjacency_matrices.dim() == 4:
+            A_init = adjacency_matrices[:, -1].to(device)
+        else:
+            # derive adjacency from last embeddings (inner-product similarity)
+            h_last = node_embeddings_seq[:, -1]  # (B, N, D)
+            sim = torch.matmul(h_last, h_last.transpose(1, 2))  # (B, N, N)
+            A_init = _postprocess_adj(sim, mask_diagonal=True)
+
+        # decode predicted adjacency (from node embeddings & latent)
+        h_last = node_embeddings_seq[:, -1]  # (B, N, D)
+        try:
+            predicted_adj = self.edge_decoder(h_last, latent_state)
+        except Exception:
+            # fallback: directly use A_init as predicted
+            predicted_adj = A_init.clone()
+
+        # evolution: roll forward using evolution module (may be PerEdgeMLP, SDE, etc.)
+        outputs = []
+        A = A_init
+        for step in range(max(1, rollout_steps)):
+            # evolve adjacency using evolution module
+            try:
+                # some evolutions accept covariates, others don't
+                try:
+                    A_next = self.evolution(A, h_last, latent_state, covariates)
+                except TypeError:
+                    A_next = self.evolution(A, h_last, latent_state)
+            except Exception:
+                # fallback: small decay to A
+                A_next = 0.98 * A
+
+            # decode adjacency from embeddings (same each step here for stability)
+            try:
+                pred_adj_step = self.edge_decoder(h_last, latent_state)
+            except Exception:
+                pred_adj_step = A_next
+
+            # clinical prediction
+            try:
+                pred_score = self.clinical_decoder(h_last, latent_state)  # (B, 1)
+            except Exception:
+                pred_score = torch.zeros(B, 1, device=device, dtype=node_features.dtype)
+
+            out = {
+                'predicted_adjacency': pred_adj_step,    # (B, N, N)
+                'evolved_adjacency': A_next,            # (B, N, N)
+                'predicted_score': pred_score,          # (B, 1)
+                'latent_state': latent_state,           # (B, latent_dim)
+                'attention_weights': None,              # placeholder (if transformer used, fill in)
+                'PA': None,
+                'PX': None
+            }
+            outputs.append(out)
+            # update adjacency for next step
+            A = A_next
+
+        # reconstructor output (optional)
+        recon = None
+        if self.use_vae_recon and hasattr(self, 'reconstructor'):
+            try:
+                recon = self.reconstructor(latent_state, N)  # (B, T_recon, N, F)
+            except Exception:
+                recon = None
+
+        # If VAE, include mu/logvar info in outputs[0] for compute_losses to pick up
+        if len(outputs) > 0:
+            if mu is not None:
+                outputs[0]['latent_mu'] = mu
+            if logvar is not None:
+                outputs[0]['latent_logvar'] = logvar
+
+        # Return (outputs, latent_sequence) or (outputs, latent_sequence, recon) depending on available recon
+        if recon is not None:
+            return outputs, latent_sequence, recon
+        return outputs, latent_sequence
+
+
+# ---------------------- Advanced mechanistic / causal modules ----------------------
+
+
+class DisentangledVAE(nn.Module):
+    """VAE with factorized latent subspaces: disease vs confounders.
+
+    - Encodes node-pooled graph features to two latents z_disease and z_confound.
+    - Reconstruction decoder consumes both.
+    - Provides adversarial discriminator to force z_confound to predict site/scanner,
+      while z_disease is discouraged from containing confound information via gradient reversal.
+    """
+    def __init__(self, input_dim: int, z_d_dim: int = 8, z_c_dim: int = 8, hidden: int = 64):
+        super().__init__()
+        self.enc = nn.Sequential(nn.Linear(input_dim, hidden), nn.ReLU(), nn.Linear(hidden, hidden))
+        # disease latents
+        self.fc_mu_d = nn.Linear(hidden, z_d_dim)
+        self.fc_logvar_d = nn.Linear(hidden, z_d_dim)
+        # confound latents
+        self.fc_mu_c = nn.Linear(hidden, z_c_dim)
+        self.fc_logvar_c = nn.Linear(hidden, z_c_dim)
+
+        self.decoder = nn.Sequential(nn.Linear(z_d_dim + z_c_dim, hidden), nn.ReLU(), nn.Linear(hidden, input_dim))
+
+        # adversarial discriminator to predict site from confound latent
+        self.discriminator = nn.Sequential(nn.Linear(z_c_dim, hidden//2), nn.ReLU(), nn.Linear(hidden//2, 1))
+
+    def reparam(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        std = (0.5 * logvar).exp()
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        h = self.enc(x)
+        mu_d = self.fc_mu_d(h); logvar_d = self.fc_logvar_d(h)
+        mu_c = self.fc_mu_c(h); logvar_c = self.fc_logvar_c(h)
+        z_d = self.reparam(mu_d, logvar_d)
+        z_c = self.reparam(mu_c, logvar_c)
+        recon = self.decoder(torch.cat([z_d, z_c], dim=-1))
+        disc_logits = self.discriminator(z_c.detach())
+        return {'recon': recon, 'mu_d': mu_d, 'logvar_d': logvar_d, 'mu_c': mu_c, 'logvar_c': logvar_c, 'z_d': z_d, 'z_c': z_c, 'disc_logits': disc_logits}
+
+
+class MultimodalCausalFusion(nn.Module):
+    """Simple causal chain between modalities with modality-specific encoders.
+
+    Example causal chain: sMRI -> atrophy -> connectivity -> cognition
+    The module enforces that encoded representations follow this causal order via a contrastive loss
+    pushing downstream representations to be predictable from upstream ones.
+    """
+    def __init__(self, modalities: Dict[str, int], embed_dim: int = 32):
+        super().__init__()
+        # modalities: name -> input_dim
+        self.encoders = nn.ModuleDict({k: nn.Sequential(nn.Linear(v, embed_dim), nn.ReLU()) for k, v in modalities.items()})
+        # simple predictors between modalities
+        self.predictors = nn.ModuleDict()
+        keys = list(modalities.keys())
+        for i in range(len(keys)-1):
+            self.predictors[f"{keys[i]}_to_{keys[i+1]}"] = nn.Linear(embed_dim, embed_dim)
+
+    def forward(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        embeds = {k: self.encoders[k](inputs[k]) for k in inputs.keys()}
+        preds = {}
+        keys = list(embeds.keys())
+        for i in range(len(keys)-1):
+            up = keys[i]; down = keys[i+1]
+            preds[f"{up}_to_{down}"] = self.predictors[f"{up}_to_{down}"](embeds[up])
+        return {'embeds': embeds, 'preds': preds}
+
+    def causal_contrastive_loss(self, embeds: Dict[str, torch.Tensor], preds: Dict[str, torch.Tensor]) -> torch.Tensor:
+        loss = 0.0
+        keys = list(embeds.keys())
+        for i in range(len(keys)-1):
+            up = keys[i]; down = keys[i+1]
+            loss = loss + F.mse_loss(preds[f"{up}_to_{down}"], embeds[down])
+        return loss
+
+
+def attention_structural_regularization(attn: torch.Tensor, anatomical_prior: torch.Tensor, weight: float = 1.0) -> torch.Tensor:
+    """Encourage attention to align with an anatomical prior adjacency.
+
+    - attn: (B, heads, N, N) attention weights (probabilities)
+    - anatomical_prior: (N,N) binary or soft adjacency
+    Returns scalar loss (MSE between mean attention and prior)
+    """
+    # reduce heads and batch
+    mean_attn = attn.mean(dim=1).mean(dim=0) if attn.dim() == 4 else attn.mean(dim=0)
+    prior = anatomical_prior.to(mean_attn.device)
+    return weight * F.mse_loss(mean_attn, prior)
+
+
+class CounterfactualOptimizer:
+    """Gradient-based continuous relaxation optimizer to find minimal interventions.
+
+    - Learns a continuous mask M in [0,1] per edge/node and optimizes objective: loss_predicted_after_do + lambda * L1(M)
+    - Returns a thresholded sparse intervention.
+    """
+    def __init__(self, model: DDGModel, lr: float = 1e-2, iters: int = 200, sparsity_lambda: float = 1.0):
+        self.model = model
+        self.lr = lr
+        self.iters = iters
+        self.sparsity_lambda = sparsity_lambda
+
+    def optimize_edge_intervention(self, A_init: torch.Tensor, node_features: Optional[torch.Tensor], target_improvement: float = 0.1) -> torch.Tensor:
+        # continuous mask per edge
+        M = torch.zeros_like(A_init, requires_grad=True)
+        opt = torch.optim.Adam([M], lr=self.lr)
+        best_mask = None
+        best_obj = float('inf')
+        # precompute node embeddings if a raw node feature matrix is provided
+        if node_features is not None and hasattr(self.model, 'encoder'):
+            with torch.no_grad():
+                node_emb_pref = self.model.encoder(node_features)
+        else:
+            node_emb_pref = node_features
+        for _ in range(self.iters):
+            opt.zero_grad()
+            # apply sigmoid to get [0,1]
+            mask = torch.sigmoid(M)
+            A_cf = A_init * (1 - mask)  # decreasing edges; can be changed
+            # synthesize short seq and decode cognition prediction via clinical decoder
+            seq = self.model.synthesize_adjacency_sequence(A_cf, node_embeddings_seq=[node_emb_pref] if node_emb_pref is not None else None, steps=1)
+            A1 = seq[0]
+            # get predicted cognition (use clinical_decoder expecting node embeddings; use encoder then decoder)
+            with torch.no_grad():
+                node_emb = self.model.encoder(node_features) if node_features is not None else None
+            # naive prediction: average node decoded score
+            try:
+                clinical = self.model.clinical_decoder(node_emb, A1)
+                pred = clinical.mean()
+            except Exception:
+                pred = torch.tensor(0.0, device=A_init.device)
+
+            obj = -pred + self.sparsity_lambda * mask.abs().mean()
+            obj.backward()
+            opt.step()
+            if obj.item() < best_obj:
+                best_obj = obj.item()
+                best_mask = mask.detach().cpu().numpy()
+
+        # return thresholded mask
+        return (best_mask > 0.5).astype(float)
+
+
+class MAMLTrainer:
+    """Simple MAML-like adapter: inner-loop finetune on small support, outer updates via meta-gradient.
+
+    This is a minimal wrapper demonstrating inner-loop adaptation; for real training use higher-quality implementation.
+    """
+    def __init__(self, model: nn.Module, inner_lr: float = 1e-2, inner_steps: int = 1):
+        self.model = model
+        self.inner_lr = inner_lr
+        self.inner_steps = inner_steps
+
+    def adapt(self, loss_fn, support_batch):
+        # create copy of parameters
+        fast_weights = {n: p.clone() for n, p in self.model.named_parameters()}
+        for _ in range(self.inner_steps):
+            loss = loss_fn(self.model, support_batch)
+            grads = torch.autograd.grad(loss, list(self.model.parameters()), create_graph=True, allow_unused=True)
+            for (name, p), g in zip(self.model.named_parameters(), grads):
+                if g is None:
+                    g = torch.zeros_like(p)
+                fast_weights[name] = fast_weights[name] - self.inner_lr * g
+            # assign fast weights back (simple approach)
+            for name, p in self.model.named_parameters():
+                p.data.copy_(fast_weights[name].data)
+        return
+
+
+def physics_monotonicity_loss(traj: torch.Tensor, vulnerable_mask: torch.Tensor, weight: float = 1.0) -> torch.Tensor:
+    """Penalize non-monotonic increases in vulnerable edges or nodes.
+
+    - traj: (T, B, N, N) adjacency sequence or (T, B, N) node loads
+    - vulnerable_mask: (N,N) or (N,) boolean mask
+    """
+    # compute differences
+    diffs = traj[1:] - traj[:-1]
+    # Penalize positive diffs on vulnerable entries if biology expects decline (here example)
+    mask = vulnerable_mask
+    if traj.dim() == 4:
+        mask = mask.to(traj.device)
+        penal = diffs.clamp(min=0.0) * mask
+    else:
+        penal = diffs.clamp(min=0.0) * mask
+    return weight * penal.pow(2).mean()
+
+
+class MultiTimescaleEncoder(nn.Module):
+    """Hierarchical encoder with fast and slow GRUs to capture multiple temporal scales."""
+    def __init__(self, input_dim: int, fast_hidden: int = 32, slow_hidden: int = 64):
+        super().__init__()
+        self.fast = nn.GRU(input_dim, fast_hidden, batch_first=True)
+        self.slow = nn.GRU(fast_hidden, slow_hidden, batch_first=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, N*F) or (B, T, F)
+        h_fast, _ = self.fast(x)
+        h_slow, _ = self.slow(h_fast)
+        # return last slow hidden
+        return h_slow[:, -1, :]
+
+
+class StructuredCounterfactualExplainer:
+    """Approximate minimal subnetwork edits to flip model prediction via sparse optimization.
+
+    - Uses L1-regularized continuous mask optimization then optionally solves integer rounding.
+    """
+    def __init__(self, model: DDGModel, lr: float = 1e-2, iters: int = 200, sparsity_lambda: float = 1.0):
+        self.model = model
+        self.lr = lr
+        self.iters = iters
+        self.sparsity_lambda = sparsity_lambda
+
+    def explain(self, A_init: torch.Tensor, node_features: Optional[torch.Tensor], target_fn) -> np.ndarray:
+        # reuse CounterfactualOptimizer for initial mask
+        cf = CounterfactualOptimizer(self.model, lr=self.lr, iters=self.iters, sparsity_lambda=self.sparsity_lambda)
+        mask = cf.optimize_edge_intervention(A_init, node_features)
+        return mask
+
+
+
+
+
+class BaselineMLPLSTM(nn.Module):
+    """Simple baseline: per-node MLP -> global pooling -> LSTM -> regression."""
+    def __init__(self, in_feats: int = 4, node_hidden: int = 32, rnn_hidden: int = 64, out_dim: int = 1):
+        super().__init__()
+        self.node_mlp = nn.Sequential(nn.Linear(in_feats, node_hidden), nn.ReLU(), nn.Linear(node_hidden, node_hidden))
+        self.pool = lambda x: x.mean(dim=2)  # (B,T,N,D)->(B,T,D)
+        self.gru = nn.GRU(node_hidden, rnn_hidden, batch_first=True)
+        self.head = nn.Sequential(nn.Linear(rnn_hidden, 64), nn.ReLU(), nn.Linear(64, out_dim))
+
+    def forward(self, node_features_sequence: torch.Tensor):
+        # node_features_sequence: (B,T,N,F)
+        B, T, N, F = node_features_sequence.shape
+        x = node_features_sequence.view(B * T, N, F)
+        x = self.node_mlp(x)  # (B*T, N, D)
+        x = x.mean(dim=1).view(B, T, -1)  # (B, T, D)
+        _, h = self.gru(x)
+        out = self.head(h.squeeze(0))
+        return out
+
+
+class StaticGNNBaseline(nn.Module):
+    """Static GNN baseline: apply GAT per timepoint, pool, feed to LSTM/regressor."""
+    def __init__(self, in_feats: int = 4, node_dim: int = 32, latent_dim: int = 32, rnn_hidden: int = 64):
+        super().__init__()
+        self.gat = GATEncoder(in_feats, node_dim, num_heads=4, head_dim=max(8, node_dim // 4))
+        self.pool = lambda x: x.mean(dim=2)
+        self.gru = nn.GRU(node_dim, rnn_hidden, batch_first=True)
+        self.head = nn.Sequential(nn.Linear(rnn_hidden, 64), nn.ReLU(), nn.Linear(64, 1))
+        def forward(self, node_features_sequence: torch.Tensor, adjacency_sequence: torch.Tensor):
+            B, T, N, F = node_features_sequence.shape
+            feats = []
+            for t in range(T):
+                x_t = node_features_sequence[:, t]
+                A_t = adjacency_sequence[:, t]
+                h = self.gat(x_t, A_t)
+                feats.append(h.mean(dim=1))
+            feats = torch.stack(feats, dim=1)
+            _, h = self.gru(feats)
+            return self.head(h.squeeze(0))
+
+# ---------------------- Losses + training utils ----------------------
+
+# Replace compute_losses function
+def compute_losses(
+    batch: Dict[str, torch.Tensor],
+    outputs: List[Dict[str, Any]],
+    latent_sequence: Optional[torch.Tensor] = None,
+    lambda_edge: float = 1.0,
+    lambda_clinical: float = 0.5,
+    lambda_latent: float = 0.1,
+    kl_beta: float = 1.0,
+    lambda_grad: float = 0.01,
+    lambda_importance: float = 0.01,
+    lambda_entropy: float = 0.01,
+    lambda_mi: float = 0.01
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Compute comprehensive loss with edge forecasting, clinical prediction, and latent regularization.
+
+    Args:
+        batch: Dictionary with 'node_features', 'adjacency_matrices', 'cognitive_scores'.
+        outputs: List of output dictionaries from rollout steps.
+        latent_sequence: (B, T, latent_dim) Latent trajectory for regularization.
+        lambda_edge: Weight for edge forecasting loss.
+        lambda_clinical: Weight for clinical prediction loss.
+        lambda_latent: Weight for latent trajectory regularization.
+        lambda_grad: Weight for gradient smoothing in edge evolution.
+
+    Returns:
+        total_loss: Combined loss tensor.
+        metrics: Dictionary of individual loss components.
+    """
+    true_next_adjacency = batch['adjacency_matrices'][:, -1]
+    true_scores = batch['cognitive_scores']
+
+    # Edge loss: compare predicted vs true
+    predicted_adjacency = outputs[0]['predicted_adjacency']
+    loss_edge = F.mse_loss(predicted_adjacency, true_next_adjacency)
+
+    # Edge smoothness: consecutive predictions should be smooth
+    if len(outputs) > 1:
+        edge_diffs = []
+        for i in range(len(outputs) - 1):
+            adj_i = outputs[i]['evolved_adjacency']
+            adj_next = outputs[i+1]['evolved_adjacency']
+            edge_diffs.append(torch.mean((adj_next - adj_i)**2))
+        loss_edge_smooth = torch.stack(edge_diffs).mean()
+        loss_edge = loss_edge + lambda_grad * loss_edge_smooth
+
+    # Clinical loss
+    predicted_score = outputs[0]['predicted_score'].squeeze(-1)
+    loss_clinical = F.mse_loss(predicted_score, true_scores)
+
+    # Latent regularization: smoothness + boundedness
+    loss_latent = torch.tensor(0.0, device=predicted_adjacency.device)
+    if latent_sequence is not None and lambda_latent > 0:
+        if latent_sequence.shape[1] > 1:
+            # Smoothness: latent should evolve gradually
+            latent_diff = torch.diff(latent_sequence, dim=1)
+            loss_smooth = torch.mean(latent_diff ** 2)
+            loss_latent = loss_latent + loss_smooth
+
+        # Boundedness: encourage z near 0
+        loss_bound = 0.1 * torch.mean(latent_sequence ** 2)
+        loss_latent = loss_latent + loss_bound
+
+        # L1 sparsity optional
+        loss_sparsity = 0.01 * torch.mean(torch.abs(latent_sequence))
+        loss_latent = loss_latent + loss_sparsity
+
+    total_loss = lambda_edge * loss_edge + lambda_clinical * loss_clinical + lambda_latent * loss_latent
+
+    # KL term for VAE-style latent encoder (if provided in outputs)
+    loss_kl = torch.tensor(0.0, device=predicted_adjacency.device)
+    try:
+        mu = outputs[0].get('latent_mu', None)
+        logvar = outputs[0].get('latent_logvar', None)
+        if mu is not None and logvar is not None:
+            # compute KL divergence to N(0, I) per batch then average
+            kl = -0.5 * torch.sum(1.0 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+            loss_kl = torch.mean(kl)
+            total_loss = total_loss + float(kl_beta) * loss_kl
+    except Exception:
+        loss_kl = torch.tensor(0.0, device=predicted_adjacency.device)
+
+    # Importance probability regularization (sparsity + entropy)
+    loss_importance = torch.tensor(0.0, device=predicted_adjacency.device)
+    try:
+        PX = outputs[0].get('PX', None)
+        PA = outputs[0].get('PA', None)
+        if PX is not None:
+            # sparsity: encourage small fraction of selected nodes
+            loss_importance = loss_importance + torch.mean(PX)
+            # entropy: encourage low entropy (push toward 0/1)
+            eps = 1e-8
+            ent = - (PX * torch.log(PX + eps) + (1.0 - PX) * torch.log(1.0 - PX + eps))
+            loss_importance = loss_importance + lambda_entropy * torch.mean(ent)
+        if PA is not None:
+            loss_importance = loss_importance + torch.mean(PA)
+            eps = 1e-8
+            ent_e = - (PA * torch.log(PA + eps) + (1.0 - PA) * torch.log(1.0 - PA + eps))
+            loss_importance = loss_importance + lambda_entropy * torch.mean(ent_e)
+        total_loss = total_loss + lambda_importance * loss_importance
+    except Exception:
+        loss_importance = torch.tensor(0.0, device=predicted_adjacency.device)
+
+    # Mutual Information objective between importance masks and labels (optional)
+    loss_mi = torch.tensor(0.0, device=predicted_adjacency.device)
+    try:
+        PX = outputs[0].get('PX', None)
+        PA = outputs[0].get('PA', None)
+        if PX is not None:
+            try:
+                from alzheimers_gnn.importance import MINELoss
+                B = PX.size(0)
+                x = PX.view(B, -1)
+                y = true_scores.view(B, 1)
+                mine = MINELoss(x_dim=x.size(1), y_dim=1)
+                mi_loss_val = mine(x, y)
+                loss_mi = mi_loss_val
+                total_loss = total_loss + lambda_mi * loss_mi
+            except Exception:
+                loss_mi = torch.tensor(0.0, device=predicted_adjacency.device)
+        elif PA is not None:
+            try:
+                from alzheimers_gnn.importance import MINELoss
+                B = PA.size(0)
+                x = PA.view(B, -1)
+                y = true_scores.view(B, 1)
+                mine = MINELoss(x_dim=x.size(1), y_dim=1)
+                mi_loss_val = mine(x, y)
+                loss_mi = mi_loss_val
+                total_loss = total_loss + lambda_mi * loss_mi
+            except Exception:
+                loss_mi = torch.tensor(0.0, device=predicted_adjacency.device)
+    except Exception:
+        loss_mi = torch.tensor(0.0, device=predicted_adjacency.device)
+
+    # Reconstruction loss (if reconstructions provided in outputs or separately)
+    loss_recon = torch.tensor(0.0, device=predicted_adjacency.device)
+    try:
+        # outputs may be from model.forward returning (preds, latent_sequence, recon)
+        recon = None
+        if isinstance(outputs, tuple) and len(outputs) == 3:
+            # legacy: model returned (outputs, latent_sequence, recon)
+            recon = outputs[2]
+        else:
+            recon = outputs[0].get('recon', None)
+        if recon is not None and 'node_features' in batch:
+            # recon: (B, T, N, F) or broadcastable
+            true_feats = batch['node_features'].to(predicted_adjacency.device)
+            if recon.size() != true_feats.size():
+                # try to broadcast/repeat along time or nodes
+                recon_adj = recon
+                # if recon is (B, T, N, F) expected; otherwise skip
+            loss_recon = F.mse_loss(recon, true_feats)
+            total_loss = total_loss + 0.5 * loss_recon
+    except Exception:
+        loss_recon = torch.tensor(0.0, device=predicted_adjacency.device)
+
+    # Biological regularization (optional): penalize increases in connectivity on vulnerable edges
+    loss_bio = torch.tensor(0.0, device=predicted_adjacency.device)
+    if 'vulnerable_edges' in batch and batch.get('vulnerable_edges') is not None and batch.get('lambda_bio', 0.0) > 0.0:
+        try:
+            vulnerable = batch['vulnerable_edges']  # expected (K,2) or list of tuples per-batch or global
+            lambda_bio = float(batch.get('lambda_bio', 0.0))
+            # prev adjacency (last observed) -- require adjacency_matrices in batch
+            if 'adjacency_matrices' in batch and batch['adjacency_matrices'] is not None:
+                prev_adj = batch['adjacency_matrices'][:, -1].to(predicted_adjacency.device)
+            else:
+                prev_adj = predicted_adjacency.detach() * 0.0
+            # compute dt = predicted - prev; penalize positive dt on vulnerable edges only
+            dt = predicted_adjacency - prev_adj
+            if isinstance(vulnerable, torch.Tensor):
+                vuln_idx = vulnerable.long()
+            else:
+                vuln_idx = torch.tensor(vulnerable, device=predicted_adjacency.device, dtype=torch.long)
+
+            # Support either global list of pairs or per-batch mask
+            if vuln_idx.dim() == 2 and vuln_idx.size(-1) == 2:
+                # gather dt values at vulnerable pairs for each batch
+                i_idx = vuln_idx[:, 0]
+                j_idx = vuln_idx[:, 1]
+                # dt: (B, N, N) -> select (B, K)
+                dt_vals = dt[:, i_idx, j_idx]
+                # penalize positive increases
+                loss_bio = torch.mean(F.relu(dt_vals))
+            else:
+                # if mask provided as (B,N,N) boolean tensor
+                mask = vuln_idx.bool()
+                masked_dt = dt * mask
+                loss_bio = torch.mean(F.relu(masked_dt))
+
+            total_loss = total_loss + lambda_bio * loss_bio
+        except Exception:
+            # ignore malformed vulnerable specification
+            loss_bio = torch.tensor(0.0, device=predicted_adjacency.device)
+
+    return total_loss, {
+        'loss_edge': loss_edge.item(),
+        'loss_clinical': loss_clinical.item(),
+        'loss_latent': loss_latent.item() if isinstance(loss_latent, torch.Tensor) else loss_latent,
+        'loss_kl': float(loss_kl.item()) if isinstance(loss_kl, torch.Tensor) else float(loss_kl),
+        'loss_importance': float(loss_importance.item()) if isinstance(loss_importance, torch.Tensor) else float(loss_importance),
+        'loss_mi': float(loss_mi.item()) if isinstance(loss_mi, torch.Tensor) else float(loss_mi),
+        'loss_recon': float(loss_recon.item()) if isinstance(loss_recon, torch.Tensor) else float(loss_recon),
+        'loss_bio': float(loss_bio.item()) if isinstance(loss_bio, torch.Tensor) else float(loss_bio),
+        'total': total_loss.item()
+    }
+
+# ---------------------- Lightning wrapper (optional) ----------------------
+
+if _HAS_PL:
+    try:
+        import importlib as _importlib_local
+        torchmetrics = _importlib_local.import_module('torchmetrics')
+    except Exception:
+        torchmetrics = None
+
+    class DDGLightning(pl.LightningModule):
+        def __init__(self, model: DDGModel, lr: float = 1e-3, weight_decay: float = 1e-5):
+            super().__init__()
+            self.model = model
+            self.lr = lr
+            self.weight_decay = weight_decay
+            self.save_hyperparameters()
+
+        def forward(self, node_features, adjacency_matrices):
+            return self.model(node_features, adjacency_matrices, rollout_steps=1, teacher_forcing_prob=1.0)
+
+        def training_step(self, batch, batch_idx):
+            node_features = batch['node_features']
+            adjacency_matrices = batch['adjacency_matrices']
+
+            # compute kl_beta (allow model to expose schedule)
+            kl_beta = getattr(self.model, 'kl_beta', 1.0)
+            outputs, latent_sequence = self.model(node_features, adjacency_matrices, rollout_steps=1, teacher_forcing_prob=0.8)
+            loss, sublogs = compute_losses(batch, outputs, latent_sequence=latent_sequence, lambda_latent=0.1, kl_beta=kl_beta)
+
+            self.log('train/loss', loss, prog_bar=True)
+            self.log('train/edge_mse', sublogs['loss_edge'])
+            self.log('train/clinical_mse', sublogs['loss_clinical'])
+            self.log('train/latent_reg', sublogs['loss_latent'])
+            return loss
+
+        def validation_step(self, batch, batch_idx):
+            node_features = batch['node_features']
+            adjacency_matrices = batch['adjacency_matrices']
+            true_scores = batch['cognitive_scores']
+
+            kl_beta = getattr(self.model, 'kl_beta', 1.0)
+            outputs, latent_sequence = self.model(node_features, adjacency_matrices, rollout_steps=1, teacher_forcing_prob=1.0)
+            loss, sublogs = compute_losses(batch, outputs, latent_sequence=latent_sequence, lambda_latent=0.1, kl_beta=kl_beta)
+
+            self.log('val/loss', loss, prog_bar=True)
+            self.log('val/edge_mse', sublogs['loss_edge'])
+            self.log('val/clinical_mse', sublogs['loss_clinical'])
+            self.log('val/latent_reg', sublogs['loss_latent'])
+
+            predicted_score = outputs[0]['predicted_score'].squeeze(-1)
+            self.log('val/clinical_mae', F.l1_loss(predicted_score, true_scores))
+            return loss
+
+        def configure_optimizers(self):
+            optimizer = torch.optim.Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode='min', factor=0.5, patience=3
+            )
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "monitor": "val/loss",
+                    "interval": "epoch",
+                    "frequency": 1
+                }
+            }
+
+# ---------------------- Animation & visualization helpers ----------------------
+
+def animate_adjacency_sequence(E_seq, title='Adjacency evolution', vmin=0.0, vmax=None, save_path=None, show_colorbar=True):
+    # E_seq: list or array of (N,N)
+    if not _HAS_MATPLOTLIB:
+        print('Warning: matplotlib not installed, skipping animation. Install with: pip install matplotlib')
+        return None
+
+    IPython_HTML = None
+    if _HAS_IPYTHON:
+        from IPython.display import HTML as IPython_HTML  # import only if IPython is present
+
+    if isinstance(E_seq, (list, tuple)):
+        E_seq = np.stack(E_seq, axis=0)
+    if vmax is None:
+        vmax = float(np.max(E_seq))
+
+    # Safe to use plt/animation because _HAS_MATPLOTLIB was checked above
+    # Import matplotlib modules locally to ensure they are present and not the global None sentinel
+    import importlib as _local_importlib
+    plt_local = _local_importlib.import_module('matplotlib.pyplot')
+    anim_local = _local_importlib.import_module('matplotlib.animation')
+
+    fig, ax = plt_local.subplots(figsize=(4,4))
+    im = ax.imshow(E_seq[0], vmin=vmin, vmax=vmax)
+    ax.set_title(f'{title} (t=0)')
+    if show_colorbar:
+        try:
+            plt_local.colorbar(im, ax=ax)
+        except Exception:
+            # non-fatal: continue without colorbar if it fails
+            pass
+
+    def update(i):
+        im.set_data(E_seq[i])
+        ax.set_title(f'{title} (t={i})')
+        return (im,)
+
+    anim = anim_local.FuncAnimation(fig, update, frames=E_seq.shape[0], interval=600, blit=True)
+    plt_local.close(fig)
+    if save_path:
+        try:
+            Writer = anim_local.writers['ffmpeg']
+            writer = Writer(fps=1, metadata=dict(artist='ddg'), bitrate=1800)
+            anim.save(save_path, writer=writer)
+            print(f'saved animation to {save_path}')
+        except Exception as e:
+            print('warning: could not save mp4 (ffmpeg may not be installed):', e)
+    if _HAS_IPYTHON and IPython_HTML is not None:
+        try:
+            return IPython_HTML(anim.to_jshtml())
+        except Exception:
+            return None
+    return None
+
+
+# ---------------------- Edge-Level Interpretability & Analysis ----------------------
+
+def compute_edge_importance(E_seq_true, E_seq_pred=None):
+    """Compute per-edge degeneration importance from a true adjacency sequence.
+
+    Args:
+        E_seq_true: list or array of (N,N) true adjacency matrices
+
+    Returns:
+        edge_importance: (N,N) matrix of total absolute changes per edge
+        top_edges: list of top-k (i,j) pairs sorted by importance
+    """
+    if isinstance(E_seq_true, (list, tuple)):
+        E_seq_true = np.stack(E_seq_true, axis=0)
+    # E_seq_pred is accepted for backward compatibility but not used
+    _ = E_seq_pred
+
+    # Compute per-edge changes
+    edge_changes = np.abs(np.diff(E_seq_true, axis=0))  # (T-1, N, N)
+    edge_importance = np.sum(edge_changes, axis=0)  # (N, N)
+
+    # Find top edges
+    N = edge_importance.shape[0]
+    flat_idx = np.argsort(edge_importance.ravel())[::-1]
+    top_edges = [(int(i), int(j)) for i, j in zip(*np.unravel_index(flat_idx[:10], (N, N)))]
+
+    return edge_importance, top_edges
+
+def compute_node_degeneration_rate(E_seq):
+    """Compute per-node strength changes over time (regional degeneration).
+
+    Args:
+        E_seq: list or array of (N,N) adjacency matrices
+
+    Returns:
+        node_strength: (N, T) strength of each node over time
+        degeneration_rate: (N,) rate of strength decline per node
+    """
+    if isinstance(E_seq, (list, tuple)):
+        E_seq = np.stack(E_seq, axis=0)
+
+    # Node strength = sum of incident edges
+    node_strength = np.sum(E_seq, axis=2)  # (T, N)
+    node_strength = node_strength.T  # (N, T)
+
+    # Degeneration rate: negative slope of strength over time
+    degeneration_rate = np.zeros(E_seq.shape[1])
+    for i in range(E_seq.shape[1]):
+        coeffs = np.polyfit(np.arange(E_seq.shape[0]), node_strength[i, :], 1)
+        degeneration_rate[i] = -coeffs[0]  # negative slope
+
+    return node_strength, degeneration_rate
+
+def compute_forecast_stability(E_seq_multi_rollout, k_steps=3):
+    """Check if multi-step forecasts converge or diverge.
+
+    Args:
+        E_seq_multi_rollout: list of E sequences with different rollout steps
+
+    Returns:
+        stability: measure of forecast divergence (lower = more stable)
+    """
+    if len(E_seq_multi_rollout) < 2:
+        return 1.0
+
+    # Compare predictions at overlapping future timepoints
+    diffs = []
+    for i in range(1, len(E_seq_multi_rollout)):
+        # Only compare first k steps
+        min_len = min(len(E_seq_multi_rollout[0]), len(E_seq_multi_rollout[i]))
+        for t in range(min(3, min_len - 1)):
+            diff = np.abs(E_seq_multi_rollout[0][t] - E_seq_multi_rollout[i][t]).mean()
+            diffs.append(diff)
+
+    return float(np.mean(diffs)) if diffs else 1.0
+
+def attention_flow_analysis(attn_seq, H_seq):
+    """Analyze how information flows through attention heads over time.
+
+    Args:
+        attn_seq: list of (B,h,N,N) attention matrices
+        H_seq: (B,T,N,D) node embeddings
+
+    Returns:
+        info_flow: (N,) measure of information flow importance per node
+    """
+    # attn_seq: list of attention from rollout
+    if len(attn_seq) == 0:
+        return None
+
+    avg_attn_seq = []
+    for att in attn_seq:
+        # convert to numpy safely (handles torch.Tensor or numpy arrays)
+        if isinstance(att, torch.Tensor):
+            att_np = att.detach().cpu().numpy()
+        else:
+            att_np = np.array(att)
+
+        # att_np can be (B, h, N, N), (h, N, N), or (N, N)
+        if att_np.ndim == 4:
+            # average over batch and heads
+            att_avg = att_np.mean(axis=(0, 1))  # (N, N)
+        elif att_np.ndim == 3:
+            # average over heads
+            att_avg = att_np.mean(axis=0)  # (N, N)
+        elif att_np.ndim == 2:
+            att_avg = att_np  # already (N,N)
+        else:
+            raise ValueError(f'Unsupported attention tensor shape: {att_np.shape}')
+
+        avg_attn_seq.append(att_avg)
+
+    # Integrate attention over time: which nodes receive most information?
+    total_attn = np.sum(avg_attn_seq, axis=0)  # (N, N)
+    info_flow = np.sum(total_attn, axis=0)  # (N,) in-degree
+
+    return info_flow / (info_flow.sum() + 1e-6)  # normalize
+
+
+def compute_node_importance_gradients(model: nn.Module, node_features: torch.Tensor, adjacency_matrices: torch.Tensor, device='cpu') -> np.ndarray:
+    """Compute gradient-based importance scores per node for predicted clinical score.
+
+    Returns normalized importance per node (N,).
+    """
+    model = model.to(device)
+    model.eval()
+    node_features = node_features.to(device).requires_grad_(True)
+    adjacency_matrices = adjacency_matrices.to(device)
+    with torch.enable_grad():
+        outputs, _ = model(node_features, adjacency_matrices, rollout_steps=1, teacher_forcing_prob=1.0)
+        pred = outputs[0]['predicted_score'].squeeze(-1).mean()
+        grads = torch.autograd.grad(pred, node_features, retain_graph=False)[0]  # (B, T, N, F)
+
+    # aggregate gradients across batch/time/features -> node importance
+    grads_np = grads.detach().cpu().numpy()
+    # mean absolute gradient across batch, time and features per node
+    imp = np.mean(np.abs(grads_np), axis=(0, 1, 3))  # (N,)
+    if imp.sum() > 0:
+        imp = imp / (imp.sum() + 1e-9)
+    return imp
+
+
+# ---------------------- Network degeneration biomarkers (Option C) ----------------------
+def edge_half_life(E_seq: np.ndarray, min_fraction: float = 0.5) -> np.ndarray:
+    """Compute half-life (in timesteps) for each edge: time until edge strength falls to min_fraction of initial.
+
+    Args:
+        E_seq: (T, N, N) adjacency sequence over time
+        min_fraction: fraction of initial strength defining 'half-life' (default 0.5)
+
+    Returns:
+        half_life: (N, N) array with half-life in timesteps (np.inf if never reaches)
+    """
+    if isinstance(E_seq, (list, tuple)):
+        E_seq = np.stack(E_seq, axis=0)
+    T, N, _ = E_seq.shape
+    half = np.full((N, N), np.inf, dtype=np.float32)
+    init = E_seq[0]
+    for t in range(1, T):
+        mask = (E_seq[t] <= init * min_fraction)
+        newly = np.where((half == np.inf) & mask)
+        for i, j in zip(newly[0], newly[1]):
+            half[i, j] = float(t)
+    return half
+
+
+def node_vulnerability_index(H_seq: np.ndarray) -> np.ndarray:
+    """Compute a vulnerability index per node from node-embedding trajectories.
+
+    H_seq: (T, N, D) or (N, T) strengths. If (T,N,D) compute L1 norm of temporal derivative per node.
+    Returns vulnerability: (N,) normalized to sum to 1.
+    """
+    H = np.array(H_seq)
+    if H.ndim == 3:
+        # compute temporal derivative (finite differences) and integrate norm
+        dH = np.diff(H, axis=0)  # (T-1, N, D)
+        vuln = np.mean(np.linalg.norm(dH, axis=-1), axis=0)  # (N,)
+    elif H.ndim == 2:
+        # already (N,T) strengths
+        dH = np.diff(H, axis=1)
+        vuln = np.mean(np.abs(dH), axis=1)
+    else:
+        raise ValueError('Unsupported H_seq shape for vulnerability computation')
+    if vuln.sum() > 0:
+        vuln = vuln / (vuln.sum() + 1e-12)
+    return vuln
+
+
+def network_entropy_over_time(E_seq: np.ndarray) -> Tuple[np.ndarray, float]:
+    """Compute network entropy at each timepoint and return mean entropy.
+
+    Entropy is computed on the normalized degree distribution at each timepoint.
+    Returns (entropies, mean_entropy).
+    """
+    if isinstance(E_seq, (list, tuple)):
+        E_seq = np.stack(E_seq, axis=0)
+    T = E_seq.shape[0]
+    entropies = np.zeros(T, dtype=np.float32)
+    for t in range(T):
+        degrees = np.sum(E_seq[t], axis=1)
+        if degrees.sum() == 0:
+            entropies[t] = 0.0
+            continue
+        p = degrees / (degrees.sum() + 1e-12)
+        entropies[t] = -np.sum(p * np.log(p + 1e-12))
+    mean_entropy = float(np.mean(entropies))
+    return entropies, mean_entropy
+
+
+def hub_collapse_rate(E_seq: np.ndarray, top_k: int = 1) -> np.ndarray:
+    """Compute collapse rate for top-k hubs: negative slope of their strengths over time.
+
+    Returns collapse_rates: (k,) where higher positive value means faster collapse.
+    """
+    if isinstance(E_seq, (list, tuple)):
+        E_seq = np.stack(E_seq, axis=0)
+    T, N, _ = E_seq.shape
+    strengths = np.sum(E_seq, axis=2)  # (T, N)
+    avg_strength = strengths.mean(axis=0)
+    hubs = np.argsort(-avg_strength)[:top_k]
+    rates = []
+    for h in hubs:
+        coeffs = np.polyfit(np.arange(T), strengths[:, h], 1)
+        rates.append(-coeffs[0])
+    return np.array(rates, dtype=np.float32)
+
+
+# ---------------------- Counterfactual connectivity interventions (Option D) ----------------------
+def apply_edge_intervention(adjacency: np.ndarray, intervention_pairs: List[Tuple[int, int]], delta: float = 0.2) -> np.ndarray:
+    """Apply additive intervention to adjacency matrix on given edge pairs.
+
+    Returns a new adjacency matrix with interventions applied (clipped to non-negative and normalized).
+    """
+    adj = adjacency.copy()
+    for (i, j) in intervention_pairs:
+        adj[i, j] = adj[i, j] + delta
+        adj[j, i] = adj[j, i] + delta
+    adj = np.clip(adj, 0.0, None)
+    if adj.max() > 0:
+        adj = adj / (adj.max() + 1e-12)
+    return adj
+
+def counterfactual_edge_intervention(
+    model: nn.Module,
+    node_features: torch.Tensor,
+    adjacency_matrices: torch.Tensor,
+    intervention_pairs: List[Tuple[int, int]],
+    delta: float = 0.2,
+    rollout_steps: int = 5,
+    device: Optional[str] = None
+) -> Dict[str, Any]:
+    """Simulate counterfactuals: intervene on edges at the last observed timepoint and rollout.
+
+    Args:
+        model: trained DDGModel
+        node_features: (B, T, N, F) tensor
+        adjacency_matrices: (B, T, N, N) tensor
+        intervention_pairs: list of (i,j) pairs to increase
+        delta: additive increase applied to each selected edge
+        rollout_steps: how many steps to forecast
+        device: device string or torch.device
+
+    Returns:
+        dict with 'original': predicted outputs without intervention,
+                     'intervened': predicted outputs with intervention,
+                     'modified_adjacency': the intervened adjacency tensor
+    """
+    device = device or (torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
+    model = model.to(device); model.eval()
+
+    node_features = node_features.to(device)
+    adjacency_matrices = adjacency_matrices.to(device)
+
+    # Original prediction
+    with torch.no_grad():
+        original_outputs, _ = model(node_features, adjacency_matrices, rollout_steps=rollout_steps, teacher_forcing_prob=1.0)
+
+    # Apply intervention to last observed adjacency for each batch
+    B, T, N, _ = adjacency_matrices.shape
+    modified_adj = adjacency_matrices.clone()
+    for b in range(B):
+        last = adjacency_matrices[b, -1].detach().cpu().numpy()
+        new_last = apply_edge_intervention(last, intervention_pairs, delta=delta)
+        modified_adj[b, -1] = torch.tensor(new_last, dtype=adjacency_matrices.dtype, device=device)
+
+    with torch.no_grad():
+        intervened_outputs, _ = model(node_features, modified_adj, rollout_steps=rollout_steps, teacher_forcing_prob=1.0)
+
+    return {
+        'original': original_outputs,
+        'intervened': intervened_outputs,
+        'modified_adjacency': modified_adj
+    }
+
+# ---------------------- Quick run / demo function ----------------------
+
+# module-global early stopping counter used by quick_demo to avoid assigning attributes to the function object
+_quick_demo_patience_counter = 0
+
+def quick_demo(train_epochs=10, device=None, use_gde=False, batch_size=16, validate=True):
+    """Complete training, validation, and analysis pipeline.
+
+    Args:
+        train_epochs: number of training epochs
+        device: torch device or auto-detect
+        use_gde: whether to use continuous-time ODE evolution
+        batch_size: training batch size
+        validate: whether to run validation checks
+    """
+    device = device or (torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
+    print(f'Starting training on device {device}')
+    print('='*80)
+
+    # Initialize model
+    model = DDGModel(in_feats=3, node_dim=32, latent_dim=12, use_edge_gru=False, use_gde=use_gde).to(device)
+    # if using VAE reconstructor, enable here
+    # re-create model with reconstructor for demo if available
+    try:
+        model = DDGModel(in_feats=3, node_dim=32, latent_dim=12, use_edge_gru=False, use_gde=use_gde, use_vae=True, use_vae_recon=True, recon_T=6).to(device)
+    except Exception:
+        pass
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+
+    # Create datasets
+    ds_train = SimulatedDDGDataset(num_subjects=120, num_regions=16, num_timepoints=6, seed=10, noise_level=0.04)
+    ds_val = SimulatedDDGDataset(num_subjects=40, num_regions=16, num_timepoints=6, seed=11, noise_level=0.04)
+    dl_train = DataLoader(ds_train, batch_size=batch_size, shuffle=True, collate_fn=collate_batch, num_workers=0)
+    dl_val = DataLoader(ds_val, batch_size=batch_size, shuffle=False, collate_fn=collate_batch, num_workers=0)
+
+    # Training loop
+    best_val_loss = float('inf')
+    train_losses = []
+    val_losses = []
+
+    for epoch in range(train_epochs):
+        # Training
+        model.train()
+        total_loss = 0.0
+        n_batches = 0
+        for batch_idx, batch in enumerate(dl_train):
+            node_features = batch['node_features'].to(device)
+            adjacency_matrices = batch['adjacency_matrices'].to(device)
+
+            optimizer.zero_grad()
+            # compute KL annealing beta (linear warmup)
+            kl_beta = float(min(1.0, (epoch + 1) / max(1.0, train_epochs * 0.5)))  # warm up over first 50% epochs
+            model.kl_beta = kl_beta
+
+            outputs, latent_sequence = model(node_features, adjacency_matrices, rollout_steps=2, teacher_forcing_prob=0.9)
+            # model.forward may return (preds, latent_seq, recon)
+            if isinstance(outputs, tuple) and len(outputs) == 3:
+                preds, latent_sequence, recon = outputs
+                loss, sublogs = compute_losses(
+                    batch,
+                    preds,
+                    latent_sequence=latent_sequence,
+                    lambda_edge=1.0,
+                    lambda_clinical=0.5,
+                    lambda_latent=0.1,
+                    kl_beta=getattr(model, 'kl_beta', 1.0)
+                )
+            else:
+                loss, sublogs = compute_losses(
+                    batch,
+                    outputs,
+                    latent_sequence=latent_sequence,
+                    lambda_edge=1.0,
+                    lambda_clinical=0.5,
+                    lambda_latent=0.1,
+                    kl_beta=getattr(model, 'kl_beta', 1.0)
+                )
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            total_loss += loss.item()
+            n_batches += 1
+
+        avg_train = total_loss / n_batches
+        train_losses.append(avg_train)
+
+        # Validation
+        if validate:
+            model.eval()
+            total_val_loss = 0.0
+            n_val = 0
+            with torch.no_grad():
+                for batch in dl_val:
+                    # Move batch to device
+                    batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+
+                    outputs, latent_sequence = model(
+                        batch['node_features'],
+                        batch['adjacency_matrices'],
+                        rollout_steps=2,
+                        teacher_forcing_prob=1.0
+                    )
+                    loss, sublogs = compute_losses(
+                        batch,
+                        outputs,
+                        latent_sequence=latent_sequence,
+                        lambda_edge=1.0,
+                        lambda_clinical=0.5,
+                        lambda_latent=0.1
+                    )
+                    total_val_loss += loss.item()
+                    n_val += 1
+
+            avg_val = total_val_loss / n_val
+            val_losses.append(avg_val)
+
+            # Early stopping
+            # use module-global counter to avoid assigning attributes to the function object
+            global _quick_demo_patience_counter
+            if avg_val < best_val_loss:
+                best_val_loss = avg_val
+                _quick_demo_patience_counter = 0
+            else:
+                _quick_demo_patience_counter = _quick_demo_patience_counter + 1
+                if _quick_demo_patience_counter >= 5:
+                    print(f'\nEarly stopping at epoch {epoch}')
+                    break
+
+            print(f'Epoch {epoch:2d}: train_loss={avg_train:.4f} | val_loss={avg_val:.4f}')
+        else:
+            print(f'Epoch {epoch:2d}: train_loss={avg_train:.4f}')
+
+        scheduler.step()
+
+    print('='*80)
+    print('Training complete!\n')
+
+    # Comprehensive evaluation
+    print('Running comprehensive evaluation...')
+    print('='*80)
+
+    model.eval()
+
+    # Get a sample for detailed analysis
+    sample_idx = 3
+    sample = ds_val[sample_idx]
+    node_features = torch.tensor(sample['node_features']).unsqueeze(0).to(device)
+    adjacency_matrices = torch.tensor(sample['adjacency_matrices']).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        outputs, latent_sequence = model(node_features, adjacency_matrices, rollout_steps=5, teacher_forcing_prob=1.0)
+        predicted_adjacencies = [out['predicted_adjacency'].cpu().numpy()[0] for out in outputs]
+        attentions = [out['attention_weights'].cpu().numpy()[0] for out in outputs]
+        latent_vals = outputs[0]['latent_state'].cpu().numpy()[0]  # (latent_dim,)
+
+    true_adjacency_sequence = [sample['adjacency_matrices'][t] for t in range(sample['adjacency_matrices'].shape[0])]
+
+    # Edge interpretability
+    print('\nEdge-Level Interpretability:')
+    print('-'*80)
+    edge_imp, top_edges = compute_edge_importance(true_adjacency_sequence)
+    print(f'  Top changing edges (i,j): {top_edges[:8]}')
+    print(f'  Edge importance range: [{edge_imp.min():.4f}, {edge_imp.max():.4f}]')
+
+    # Node degeneration analysis
+    print('\nNode-Level Degeneration:')
+    print('-'*80)
+    node_str, degen_rate = compute_node_degeneration_rate(true_adjacency_sequence)
+    top_degen = np.argsort(-degen_rate)[:5]
+    print(f'  Top degenerating regions: {top_degen.tolist()}')
+    print(f'  Degeneration rates: {degen_rate[top_degen]}')
+    print(f'  Mean strength trajectory: {node_str.mean(axis=0)}')
+
+    # Attention flow analysis
+    print('\nAttention Flow Analysis:')
+    print('-'*80)
+    if attentions:
+        info_flow = attention_flow_analysis(attentions, None)
+        if info_flow is not None:
+            top_info = np.argsort(-info_flow)[:5]
+            print(f'  Top information-receiving regions: {top_info.tolist()}')
+            print(f'  Information flow: {info_flow[top_info]}')
+
+    # Forecast stability
+    print('\nForecast Stability:')
+    print('-'*80)
+    with torch.no_grad():
+        outputs_1 = model(node_features, adjacency_matrices, rollout_steps=1, teacher_forcing_prob=1.0)[0]
+        outputs_3 = model(node_features, adjacency_matrices, rollout_steps=3, teacher_forcing_prob=1.0)[0]
+        E_1 = [outputs_1[0]['predicted_adjacency'].cpu().numpy()[0]]
+        E_3 = [out['predicted_adjacency'].cpu().numpy()[0] for out in outputs_3[:1]]
+        stability = compute_forecast_stability([E_1, E_3])
+        print(f'  Forecast divergence: {stability:.4f}')
+        print(f'  (Lower = more stable predictions)')
+
+    # Latent space analysis
+    print('\nLatent Space:')
+    print('-'*80)
+    print(f'  z vector norm: {np.linalg.norm(latent_vals):.4f}')
+    print(f'  z components: {latent_vals[:5]}...')  # first 5 components
+
+    # Clinical prediction
+    print('\nClinical Prediction:')
+    print('-'*80)
+    predicted_score_sample = outputs[0]['predicted_score'].item()
+    true_score_sample = sample['cognitive_score']
+    print(f'  Predicted Score: {predicted_score_sample:.2f}')
+    print(f'  True Score: {true_score_sample:.2f}')
+    print(f'  Prediction error: {abs(predicted_score_sample - true_score_sample):.2f}')
+
+    # Edge trajectory plotting
+    print('\nEdge Trajectory Analysis:')
+    print('-'*80)
+    try:
+        if not _HAS_MATPLOTLIB:
+            print('  Skipping plotting: matplotlib not available')
+        else:
+            # Import matplotlib locally to avoid static analyzers complaining about global `plt` possibly being None
+            import importlib as _local_importlib
+            plt_local = _local_importlib.import_module('matplotlib.pyplot')
+            fig, axes = plt_local.subplots(2, 2, figsize=(12, 8))
+
+            # Plot 1: Top edge trajectories
+            ax = axes[0, 0]
+            for (i, j) in top_edges[:3]:
+                true_vals = [true_adjacency_sequence[t][i, j] for t in range(len(true_adjacency_sequence))]
+                pred_vals = [predicted_adjacencies[t][i, j] for t in range(len(predicted_adjacencies))]
+                xs_true = np.arange(len(true_vals))
+                xs_pred = np.arange(len(true_adjacency_sequence)-1, len(true_adjacency_sequence)-1 + len(pred_vals))
+                ax.plot(xs_true, true_vals, '--o', label=f'true {i}-{j}', alpha=0.7)
+                ax.plot(xs_pred, pred_vals, '-x', label=f'pred {i}-{j}', alpha=0.7)
+            ax.set_xlabel('Time'); ax.set_ylabel('Edge weight')
+            ax.set_title('Top-3 Edge Trajectories')
+            ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+
+            # Plot 2: Node strength over time
+            ax = axes[0, 1]
+            for r in top_degen[:3]:
+                ax.plot(node_str[r, :], '-o', label=f'Region {r}')
+            ax.set_xlabel('Time'); ax.set_ylabel('Node strength')
+            ax.set_title('Top-3 Degenerating Regions')
+            ax.legend(); ax.grid(True, alpha=0.3)
+
+            # Plot 3: Loss curves
+            ax = axes[1, 0]
+            ax.plot(train_losses, '-o', label='train', linewidth=2)
+            if val_losses:
+                ax.plot(val_losses, '-s', label='validation', linewidth=2)
+            ax.set_xlabel('Epoch'); ax.set_ylabel('Loss')
+            ax.set_title('Training Curves')
+            ax.legend(); ax.grid(True, alpha=0.3)
+
+            # Plot 4: Adjacency matrix heatmap
+            ax = axes[1, 1]
+            E_final_pred = predicted_adjacencies[-1] if predicted_adjacencies else true_adjacency_sequence[-1]
+            im = ax.imshow(E_final_pred, cmap='viridis')
+            ax.set_title('Final Predicted Adjacency')
+            try:
+                plt_local.colorbar(im, ax=ax)
+            except Exception:
+                pass
+
+            plt_local.tight_layout()
+            plt_local.savefig('/tmp/ddg_analysis.png', dpi=100, bbox_inches='tight')
+            print('  Saved analysis plots to /tmp/ddg_analysis.png')
+            plt_local.close()
+    except Exception as e:
+        print(f'  Plotting failed: {e}')
+
+    # Animation
+    print('\nAnimation Generation:')
+    print('-'*80)
+    try:
+        full_seq = true_adjacency_sequence + predicted_adjacencies
+        html = animate_adjacency_sequence(full_seq, title='Observed + Predicted Adj', save_path='/tmp/ddg_evolution.mp4')
+        print('  Animation saved to /tmp/ddg_evolution.mp4')
+    except Exception as e:
+        print(f'  Animation failed: {e}')
+
+    print('='*80)
+    print('Evaluation complete!')
+    print('='*80)
+
+    return model, (train_losses, val_losses)
+
+
+def demo_multimodal_synthetic(device=None):
+    """Small demo that builds synthetic timeseries, computes multimodal components,
+    and runs a forward pass with learnable multimodal weights and importance heads.
+    """
+    device = device or (torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
+    B = 4
+    T = 6
+    N = 12
+    F = 4
+
+    # synthetic timeseries per sample (B, T, N)
+    timeseries_batch = np.random.randn(B, T, N).astype(np.float32) * 0.1
+    node_feats_batch = np.stack([node_features_from_timeseries(timeseries_batch[b]) for b in range(B)], axis=0)
+
+    # compute base adjacency components and combined empirical adjacency
+    adj_R = np.zeros((B, T, N, N), dtype=np.float32)
+    adj_MI = np.zeros_like(adj_R)
+    adj_coh = np.zeros_like(adj_R)
+    adj_comb = np.zeros_like(adj_R)
+    for b in range(B):
+        for t in range(T):
+            # use a short window around t
+            s = max(0, t - 2)
+            e = min(T, t + 1)
+            win = timeseries_batch[b, s:e]
+            R = compute_empirical_fc_from_timeseries(win)
+            I = compute_mutual_info_matrix(win)
+            C = compute_coherence_matrix(win)
+            adj_R[b, t] = R
+            adj_MI[b, t] = I
+            adj_coh[b, t] = C
+            adj_comb[b, t] = compute_multimodal_adjacency(win)
+
+    node_feats = torch.tensor(node_feats_batch).to(device)
+    adj_tensor = torch.tensor(adj_comb).to(device)
+    adj_components = {
+        'adj_R': torch.tensor(adj_R).to(device),
+        'adj_MI': torch.tensor(adj_MI).to(device),
+        'adj_coh': torch.tensor(adj_coh).to(device)
+    }
+
+    model = DDGModel(in_feats=F, node_dim=32, latent_dim=12, use_adaptive_edges=True, use_vae=True, use_vae_recon=True, recon_T=T).to(device)
+    model.eval()
+    with torch.no_grad():
+        outputs, latent_seq, recon = model(node_feats, adj_tensor, adj_components=adj_components, rollout_steps=2, teacher_forcing_prob=1.0)
+    print('Demo multimodal forward pass completed. Outputs keys:', list(outputs[0].keys()))
+    print('Recon shape:', recon.shape if recon is not None else None)
+    return model, outputs, recon
+
+
+
+
+def evaluate_models(models: Dict[str, nn.Module], dataloader: DataLoader, device=None) -> Dict[str, Dict[str, float]]:
+    """Evaluate multiple models on a dataloader and return MSE metrics.
+
+    Args:
+        models: dict mapping name->nn.Module
+        dataloader: PyTorch DataLoader yielding batches compatible with models
+    """
+    device = device or (torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
+    results = {name: {'mse': 0.0, 'n': 0} for name in models.keys()}
+    for name, m in models.items():
+        m.to(device)
+        m.eval()
+
+    with torch.no_grad():
+        for batch in dataloader:
+            # move tensors
+            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            X = batch['node_features']
+            A = batch['adjacency_matrices']
+            y = batch['cognitive_scores'].to(device)
+            for name, m in models.items():
+                try:
+                    if isinstance(m, BaselineMLPLSTM):
+                        y_hat = m(X)
+                    elif isinstance(m, StaticGNNBaseline):
+                        y_hat = m(X, A)
+                    else:
+                        # assume DDGModel-like: forward returns (preds, latent[, recon])
+                        out = m(X, A, rollout_steps=1, teacher_forcing_prob=1.0)
+                        if isinstance(out, tuple):
+                            preds = out[0]
+                        else:
+                            preds = out
+                        # take predicted_score
+                        y_hat = preds[0]['predicted_score'].squeeze(-1)
+                except Exception:
+                    # fallback: zero prediction
+                    y_hat = torch.zeros_like(y)
+
+                mse = F.mse_loss(y_hat, y, reduction='sum').item()
+                results[name]['mse'] += mse
+                results[name]['n'] += y.size(0)
+
+    # finalize
+    for name in results.keys():
+        if results[name]['n'] > 0:
+            results[name]['mse'] = results[name]['mse'] / results[name]['n']
+        else:
+            results[name]['mse'] = float('nan')
+    return results
+
+# ---------------------- PrecomputedConnectomeDataset (HDF5/NPZ) ----------------------
+
+# Note: h5py, csv, and Path already imported at top; just using them here
+class PrecomputedConnectomeDataset(Dataset):
+    """
+    Dataset expecting one file per subject sequence OR a master CSV index.
+
+    Supported input options:
+    - Per-subject .npz with keys: 'adjacency_matrices' (T,N,N), 'node_features' (T,N,F), 'times' (T,), 'cognitive_score' float or (T,)
+    - Per-subject HDF5 with same dataset names (requires h5py).
+    - Master CSV where each row points to a file and optional metadata columns.
+    """
+
+    def __init__(self, paths_or_csv: str, root: Optional[str] = None, file_format: Optional[str] = None, transform=None):
+        self.transform = transform
+        self.root = Path(root) if root is not None else None
+        self.entries = []
+
+        if isinstance(paths_or_csv, (list, tuple)):
+            for p in paths_or_csv:
+                self.entries.append({'path': str(p)})
+        else:
+            p = Path(paths_or_csv)
+            if p.suffix.lower() == '.csv':
+                if not p.exists():
+                    raise FileNotFoundError(f'CSV index not found: {p}')
+                with open(p, 'r') as fh:
+                    reader = csv.DictReader(fh)
+                    for row in reader:
+                        rowpath = row.get('path')
+                        if rowpath is None:
+                            raise ValueError('CSV must have a "path" column')
+                        if self.root is not None and not Path(rowpath).is_absolute():
+                            rowpath = str(self.root / rowpath)
+                        row['path'] = rowpath
+                        self.entries.append(row)
+            else:
+                raise ValueError('paths_or_csv must be list or path to CSV index')
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def _load_file(self, path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[float], Dict]:
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f'Data file not found: {path}')
+
+        if p.suffix == '.npz':
+            d = np.load(p, allow_pickle=True)
+            # Support legacy keys X_seq/E_seq or new keys
+            if 'adjacency_matrices' in d.files:
+                adjacency_matrices = d['adjacency_matrices']
+                node_features = d['node_features']
+            elif 'E_seq' in d.files:
+                adjacency_matrices = d['E_seq']
+                node_features = d['X_seq']
+            else:
+                raise ValueError(f'NPZ file missing required keys: {path}')
+
+            times = d['times'] if 'times' in d.files else np.arange(len(adjacency_matrices))
+
+            cognitive_score = None
+            if 'cognitive_score' in d.files:
+                cognitive_score = d['cognitive_score']
+            elif 'mmse' in d.files:
+                cognitive_score = d['mmse']
+            # coerce scalar arrays to Python float for downstream typing
+            if isinstance(cognitive_score, np.ndarray) and cognitive_score.size == 1:
+                try:
+                    cognitive_score = float(cognitive_score.item())
+                except Exception:
+                    pass
+
+            meta = dict()
+            if 'meta' in d.files:
+                try:
+                    meta = d['meta'].item()
+                except Exception:
+                    meta = dict()
+            return node_features.astype(np.float32), adjacency_matrices.astype(np.float32), times, cognitive_score, meta
+
+        elif p.suffix in ('.h5', '.hdf5'):
+            # import h5py lazily to avoid static analyzer complaints and make dependency optional
+            try:
+                import importlib as _il
+                h5py_local = _il.import_module('h5py')
+            except Exception:
+                raise RuntimeError('h5py not installed. Install with: pip install h5py')
+            with h5py_local.File(p, 'r') as fh:
+                if 'adjacency_matrices' in fh:
+                    adjacency_matrices = np.array(fh['adjacency_matrices'])
+                    node_features = np.array(fh['node_features'])
+                elif 'E_seq' in fh:
+                    adjacency_matrices = np.array(fh['E_seq'])
+                    node_features = np.array(fh['X_seq'])
+                else:
+                    raise ValueError(f'HDF5 file missing required keys: {path}')
+
+                times = np.array(fh['times']) if 'times' in fh else np.arange(len(adjacency_matrices))
+
+                cognitive_score = None
+                if 'cognitive_score' in fh:
+                    cognitive_score = np.array(fh['cognitive_score'])
+                elif 'mmse' in fh:
+                    cognitive_score = np.array(fh['mmse'])
+                if isinstance(cognitive_score, np.ndarray) and cognitive_score.size == 1:
+                    try:
+                        cognitive_score = float(cognitive_score.item())
+                    except Exception:
+                        pass
+
+                meta = dict()
+                if 'meta' in fh:
+                    try:
+                        meta = json.loads(fh['meta'][()])
+                    except Exception:
+                        meta = dict()
+                return node_features.astype(np.float32), adjacency_matrices.astype(np.float32), times, cognitive_score, meta
+        else:
+            raise ValueError('Unsupported file type: ' + p.suffix)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        entry = self.entries[idx]
+        path = entry['path']
+        node_features, adjacency_matrices, times, score, meta = self._load_file(path)
+
+        out = {
+            'node_features': torch.tensor(node_features, dtype=torch.float32),
+            'adjacency_matrices': torch.tensor(adjacency_matrices, dtype=torch.float32),
+            'times': torch.tensor(times, dtype=torch.float32),
+            'cognitive_scores': torch.tensor(float(score)) if score is not None else torch.tensor(float('nan')),
+            'metadata': meta
+        }
+        if self.transform is not None:
+            out = self.transform(out)
+        return out
+
+# ---------------------- Augmentations for Temporal Contrastive Learning ----------------------
+
+# Augmentations should be label-preserving but diverse. We provide safe defaults
+# tailored to connectome data: edge perturbation, node feature masking, gaussian noise.
+
+def augment_edge_perturbation(adjacency_matrix: np.ndarray, drop_rate: float = 0.08, noise_scale: float = 0.01) -> np.ndarray:
+    """Randomly drops edges and adds noise to adjacency matrix."""
+    adj = adjacency_matrix.copy()
+    num_nodes = adj.shape[0]
+
+    # Drop edges
+    mask = (np.random.rand(num_nodes, num_nodes) > drop_rate).astype(float)
+    mask = 0.5 * (mask + mask.T)  # Keep symmetry
+    adj = adj * mask
+
+    # Add noise
+    adj = adj + noise_scale * np.random.randn(num_nodes, num_nodes)
+    adj = 0.5 * (adj + adj.T)
+    adj = np.clip(adj, 0.0, None)
+
+    if adj.max() > 0:
+        adj = adj / (adj.max() + 1e-6)
+    return adj
+
+def augment_node_mask(node_features: np.ndarray, mask_prob: float = 0.1) -> np.ndarray:
+    """Randomly masks node features."""
+    features = node_features.copy()
+    num_nodes, num_features = features.shape
+    mask = (np.random.rand(num_nodes, num_features) > mask_prob).astype(float)
+    features = features * mask
+    return features
+
+def augment_gaussian_noise(node_features: np.ndarray, scale: float = 0.02) -> np.ndarray:
+    # Adds Gaussian noise to node features.
+    return node_features + scale * np.random.randn(*node_features.shape)
+
+def random_augment(sample: Dict[str, Any], edge_drop: float = 0.08, node_mask: float = 0.1, noise_scale: float = 0.02) -> Tuple[np.ndarray, np.ndarray]:
+    # Applies random augmentations to a sample for contrastive learning.
+    node_features = sample['node_features']
+    adjacency_matrices = sample['adjacency_matrices']
+
+    # Choose time index randomly within the subject sequence
+    num_timepoints = node_features.shape[0]
+    t = np.random.randint(0, num_timepoints)
+
+    features_t = node_features[t]
+    adjacency_t = adjacency_matrices[t]
+
+    features_aug = augment_node_mask(features_t, mask_prob=node_mask)
+    features_aug = augment_gaussian_noise(features_aug, scale=noise_scale)
+
+    adjacency_aug = augment_edge_perturbation(adjacency_t, drop_rate=edge_drop, noise_scale=noise_scale)
+
+    return features_aug, adjacency_aug
+
+# ---------------------- NT-Xent loss (vectorized, numerically stable) ----------------------
+
+class NTXentLoss(nn.Module):
+    # Normalized Temperature-scaled Cross Entropy Loss (SimCLR-style).
+    # Expects two batches of projections z_i, z_j of shape (B, D).
+    def __init__(self, temperature=0.1, eps=1e-8):
+        super().__init__()
+        self.temperature = temperature
+        self.eps = eps
+
+    def forward(self, z1, z2):
+        # z1, z2: (B, D)
+        device = z1.device
+        B = z1.shape[0]
+        z = torch.cat([z1, z2], dim=0)  # 2B x D
+        z = F.normalize(z, dim=1)
+        sim = torch.matmul(z, z.t()) / self.temperature  # 2B x 2B
+        # For numerical stability, subtract max on each row
+        sim_max, _ = torch.max(sim, dim=1, keepdim=True)
+        sim = sim - sim_max.detach()
+        exp_sim = torch.exp(sim)
+        # mask to remove self-similarity
+        mask = (~torch.eye(2*B, dtype=torch.bool, device=device)).float()
+        exp_sim = exp_sim * mask
+        # positive similarities: i with i+B and i+B with i (correctly aligned)
+        z1_norm = F.normalize(z1, dim=1)
+        z2_norm = F.normalize(z2, dim=1)
+        pos_sim_12 = torch.sum(z1_norm * z2_norm, dim=-1) / self.temperature  # (B,)
+        pos_sim_21 = torch.sum(z2_norm * z1_norm, dim=-1) / self.temperature  # (B,)
+        pos = torch.cat([torch.exp(pos_sim_12), torch.exp(pos_sim_21)], dim=0)  # (2B,)
+        # denominator: sum over row excluding self
+        denom = exp_sim.sum(dim=1)
+        loss = -torch.log(pos / (denom + self.eps))
+        return loss.mean()
+
+# ---------------------- Projection head & Pretraining Encoder wrapper ----------------------
+
+class ProjectionHead(nn.Module):
+    def __init__(self, in_dim, proj_dim=64, hidden=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, proj_dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+# Pretrain wrapper takes GraphEncoder (node-level) and pools into graph-level
+class PretrainEncoder(nn.Module):
+    # Wrapper for GraphEncoder to pool node embeddings into graph embeddings.
+
+    def __init__(self, graph_encoder: GraphEncoder, pool: str = 'mean'):
+        super().__init__()
+        self.encoder = graph_encoder
+        self.pool = pool
+
+    def forward(self, node_features: torch.Tensor, adjacency_matrix: torch.Tensor) -> torch.Tensor:
+        # Handle single instance vs batch
+        is_single = False
+        if node_features.dim() == 2:
+            node_features = node_features.unsqueeze(0)
+            adjacency_matrix = adjacency_matrix.unsqueeze(0)
+            is_single = True
+        elif node_features.dim() == 3 and adjacency_matrix.dim() == 2:
+            # Batch of features but single adjacency; broadcast adjacency
+            adjacency_matrix = adjacency_matrix.unsqueeze(0).expand(node_features.shape[0], -1, -1)
+
+        node_embeddings = self.encoder(node_features, adjacency_matrix)  # (B, N, D)
+
+        if self.pool == 'mean':
+            graph_embedding = node_embeddings.mean(dim=1)  # (B, D)
+        else:
+            graph_embedding = node_embeddings.max(dim=1)[0]
+
+        if is_single:
+            return graph_embedding.squeeze(0)
+        return graph_embedding
+
+# ---------------------- Lightning pretraining module ----------------------
+
+if _HAS_PL:
+    class ContrastivePretrainModule(pl.LightningModule):
+        def __init__(self, graph_encoder: GraphEncoder, proj_dim=64, lr=1e-3, weight_decay=1e-6, temperature=0.1):
+            super().__init__()
+            self.save_hyperparameters(ignore=['graph_encoder'])
+            self.encoder = PretrainEncoder(graph_encoder)
+            self.proj = ProjectionHead(self.encoder.encoder.node_mlp[-1].out_features, proj_dim=proj_dim)
+            self.loss_fn = NTXentLoss(temperature=temperature)
+            self.lr = lr
+            self.weight_decay = weight_decay
+
+        def training_step(self, batch, batch_idx):
+            # Batch contains sequences; sample two augmented views per sequence
+            batch_size = batch['node_features'].shape[0]
+            z1_list = []
+            z2_list = []
+
+            for i in range(batch_size):
+                features_i = batch['node_features'][i].cpu().numpy()
+                adjacency_i = batch['adjacency_matrices'][i].cpu().numpy()
+
+                v1_features, v1_adj = random_augment({'node_features': features_i, 'adjacency_matrices': adjacency_i})
+                v2_features, v2_adj = random_augment({'node_features': features_i, 'adjacency_matrices': adjacency_i})
+
+                # Encode pooled graph embeddings
+                g1 = self.encoder(
+                    torch.tensor(v1_features, dtype=torch.float32).to(self.device),
+                    torch.tensor(v1_adj, dtype=torch.float32).to(self.device)
+                )
+                g2 = self.encoder(
+                    torch.tensor(v2_features, dtype=torch.float32).to(self.device),
+                    torch.tensor(v2_adj, dtype=torch.float32).to(self.device)
+                )
+                z1_list.append(g1)
+                z2_list.append(g2)
+
+            z1 = torch.stack(z1_list, dim=0)
+            z2 = torch.stack(z2_list, dim=0)
+
+            p1 = self.proj(z1)
+            p2 = self.proj(z2)
+
+            loss = self.loss_fn(p1, p2)
+            self.log('pretrain/loss', loss, prog_bar=True, on_step=True, on_epoch=True)
+            return loss
+
+        def configure_optimizers(self):
+            opt = torch.optim.Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+            return opt
+
+# ---------------------- Pretraining & Finetuning utility functions ----------------------
+
+def save_pretrained_encoder(encoder: GraphEncoder, proj: ProjectionHead, path: str):
+    dirn = os.path.dirname(path)
+    if dirn:
+        os.makedirs(dirn, exist_ok=True)
+    torch.save({'encoder_state': encoder.state_dict(), 'proj_state': proj.state_dict()}, path)
+
+def load_pretrained_encoder(encoder: GraphEncoder, proj: ProjectionHead, path: str, device: 'cpu') -> Tuple[GraphEncoder, ProjectionHead]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f'Pretrained checkpoint not found: {path}')
+    ckpt = torch.load(path, map_location=device)
+    if 'encoder_state' not in ckpt or 'proj_state' not in ckpt:
+        raise RuntimeError('Pretrained checkpoint missing encoder_state or proj_state')
+    encoder.load_state_dict(ckpt['encoder_state'])
+    proj.load_state_dict(ckpt['proj_state'])
+    return encoder, proj
+
+# Finetune helper: load pretrained encoder weights into DDGModel.encoder
+
+def inject_pretrained_into_ddg(ddg_model: DDGModel, pretrained_path: str, device: Optional[Union[str, torch.device]] = None):
+    """Load pretrained encoder state dict into a DDGModel; `device` may be a string or torch.device or None."""
+    if not os.path.exists(pretrained_path):
+        raise FileNotFoundError(f'Pretrained checkpoint not found: {pretrained_path}')
+    map_location = device if device is not None else 'cpu'
+    sd = torch.load(pretrained_path, map_location=map_location)
+    # we expect keys under 'encoder_state'
+    enc_state = sd.get('encoder_state', None)
+    if enc_state is None:
+        raise RuntimeError('Pretrained checkpoint missing encoder_state')
+    # load selectively (strict=False to allow shape mismatches)
+    try:
+        ddg_model.encoder.load_state_dict(enc_state, strict=False)
+    except Exception as e:
+        print(f'Warning: partial load of encoder weights due to mismatch: {e}')
+    return ddg_model
+
+# ---------------------- Finetune pipeline cells (script-friendly) ----------------------
+
+def pretrain_contrastive_main(index_csv, save_path, epochs=200, batch_size=16, gpus=0):
+    # index_csv: CSV with 'path' column pointing to per-subject .npz or .h5
+    ds = PrecomputedConnectomeDataset(index_csv)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=True, collate_fn=collate_batch)
+    # instantiate encoder
+    graph_enc = GraphEncoder(in_features=3, hidden_dim=32)
+    module = ContrastivePretrainModule(graph_enc, proj_dim=64)
+    trainer = pl.Trainer(gpus=1 if gpus>0 else 0, max_epochs=epochs)
+    trainer.fit(module, dl)
+    # save encoder + projector
+    save_pretrained_encoder(module.encoder.encoder, module.proj, save_path)
+    print('Saved pretrained encoder to', save_path)
+
+
+def finetune_ddg_main(pretrained_path, train_csv, val_csv, ckpt_save, epochs=100, batch_size=8, gpus=0):
+    # load data
+    ds_train = PrecomputedConnectomeDataset(train_csv)
+    ds_val = PrecomputedConnectomeDataset(val_csv)
+    dl_train = DataLoader(ds_train, batch_size=batch_size, shuffle=True, collate_fn=collate_batch)
+    dl_val = DataLoader(ds_val, batch_size=batch_size, shuffle=False, collate_fn=collate_batch)
+    device = torch.device('cuda' if torch.cuda.is_available() and gpus>0 else 'cpu')
+    model = DDGModel(in_feats=3, node_dim=32, latent_dim=12, use_edge_gru=False, use_gde=False)
+    model = inject_pretrained_into_ddg(model, pretrained_path, device=device)
+    if _HAS_PL:
+        lit = DDGLightning(model)
+        trainer = pl.Trainer(gpus=1 if gpus>0 else 0, max_epochs=epochs)
+        trainer.fit(lit, dl_train, dl_val)
+        # save checkpoint
+        trainer.save_checkpoint(ckpt_save)
+    else:
+        # fallback: simple training loop
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+        model.to(device)
+        for epoch in range(epochs):
+            model.train()
+            train_loss = 0.0
+            for batch in dl_train:
+                node_features = batch['node_features'].to(device)
+                adjacency_matrices = batch['adjacency_matrices'].to(device)
+                true_scores = batch['cognitive_scores'].to(device)
+
+                optimizer.zero_grad()
+                outputs, _ = model(node_features, adjacency_matrices, rollout_steps=1, teacher_forcing_prob=0.8)
+                loss, sublogs = compute_losses(
+                    batch,
+                    outputs
+                )
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item()
+            print(f'Epoch {epoch}, train_loss {train_loss/len(dl_train):.4f}')
+        # save state
+        torch.save(model.state_dict(), ckpt_save)
+        print('Saved finetuned ddg model to', ckpt_save)
+
+# ---------------------- Comprehensive Evaluation Metrics & Baselines ----------------------
+
+def evaluate_clinical_trajectory(model: DDGModel, dataloader, device='cpu', forecast_horizon=5):
+    """Evaluate multi-step clinical outcome forecasting.
+
+    Args:
+        model: trained DDGModel
+        dataloader: validation dataloader
+        forecast_horizon: how many steps ahead to predict
+
+    Returns:
+        dict with MSE at different horizons, MAE, correlation
+    """
+    if not _HAS_SCIPY:
+        print('Warning: scipy not available, skipping Spearman correlation')
+        return {}
+    from scipy.stats import spearmanr
+
+    model.to(device)
+    model.eval()
+    y_true_all = []
+    y_pred_all = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            node_features = batch['node_features'].to(device)
+            adjacency_matrices = batch['adjacency_matrices'].to(device)
+            true_scores = batch['cognitive_scores'].to(device)
+
+            outputs, latent_sequence = model(node_features, adjacency_matrices, rollout_steps=min(forecast_horizon, 3), teacher_forcing_prob=1.0)
+
+            # Average predictions across rollout
+            predicted_score = outputs[0]['predicted_score'].squeeze(-1).cpu().numpy()
+            y_true_all.append(true_scores.cpu().numpy())
+            y_pred_all.append(predicted_score)
+
+    y_true = np.concatenate(y_true_all)
+    y_pred = np.concatenate(y_pred_all)
+
+    mse = ((y_true - y_pred)**2).mean()
+    mae = np.abs(y_true - y_pred).mean()
+    res = spearmanr(y_true, y_pred)
+    # Convert result to tuple and extract numeric entries robustly
+    try:
+        res_t = tuple(res)
+        stat = float(res_t[0])
+        pval = float(res_t[1])
+    except Exception:
+        stat = float('nan')
+        pval = float('nan')
+
+    return {
+        'mse': float(mse),
+        'mae': float(mae),
+        'spearman': stat,
+        'spearman_pval': pval,
+        'n_samples': len(y_true)
+    }
+
+def evaluate_edge_forecast_auroc(model: DDGModel, dataloader, device='cpu'):
+    # Evaluate edge prediction accuracy with ROC-AUC (edge degeneration detection).
+
+    # Returns:
+    #     dict with edge MSE, AUROC, AUPR, and edge prediction accuracy at thresholds
+    if not _HAS_SKLEARN:
+        print('Warning: sklearn not available, skipping AUROC/AUPR')
+        return {}
+    from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve, precision_recall_curve
+
+    model.to(device); model.eval()
+    edge_mse = []
+    y_true_bin = []  # binary: edge weakened or not
+    y_score = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            node_features = batch['node_features'].to(device)
+            adjacency_matrices = batch['adjacency_matrices'].to(device)
+
+            outputs, latent_sequence = model(node_features, adjacency_matrices, rollout_steps=1, teacher_forcing_prob=1.0)
+
+            predicted_adjacency = outputs[0]['predicted_adjacency']
+            true_next_adjacency = batch['adjacency_matrices'][:, -1].to(device)
+
+            # Use previous timepoint to determine if edge weakened
+            if batch['adjacency_matrices'].shape[1] >= 2:
+                prev_adjacency = batch['adjacency_matrices'][:, -2].to(device)
+            else:
+                prev_adjacency = true_next_adjacency
+
+            edge_mse.append(((predicted_adjacency - true_next_adjacency)**2).mean().item())
+
+            # Binary labels: did edge weaken?
+            weakened = (true_next_adjacency < (prev_adjacency * 0.8)).cpu().numpy().ravel()
+            y_true_bin.append(weakened)
+            y_score.append(predicted_adjacency.cpu().numpy().ravel())
+
+    edge_mse_val = float(np.mean(edge_mse))
+    y_true_bin = np.concatenate(y_true_bin)
+    y_score = np.concatenate(y_score)
+
+    results = {'edge_mse': edge_mse_val}
+    try:
+        auroc = roc_auc_score(y_true_bin, y_score)
+        aupr = average_precision_score(y_true_bin, y_score)
+        results['auroc'] = float(auroc)
+        results['aupr'] = float(aupr)
+    except Exception:
+        pass
+
+    return results
+
+
+def _compute_midrank(x: np.ndarray) -> np.ndarray:
+    # from Sun & Xu, adapted
+    J = np.argsort(x)
+    Z = x[J]
+    N = len(x)
+    T = np.zeros(N, dtype=float)
+    i = 0
+    while i < N:
+        j = i
+        while j + 1 < N and Z[j + 1] == Z[i]:
+            j += 1
+        T[i:j + 1] = 0.5 * (i + j) + 1
+        i = j + 1
+    T2 = np.empty(N, dtype=float)
+    T2[J] = T
+    return T2
+
+
+def _fast_delong(predictions_sorted_transposed: np.ndarray, label_1_count: int):
+    m = label_1_count
+    n = predictions_sorted_transposed.shape[1] - m
+    k = predictions_sorted_transposed.shape[0]
+    tx = np.zeros((k, m), dtype=float)
+    ty = np.zeros((k, n), dtype=float)
+    aucs = np.zeros(k, dtype=float)
+    for r in range(k):
+        x = predictions_sorted_transposed[r, :]
+        tx[r, :] = _compute_midrank(x[:m])
+        ty[r, :] = _compute_midrank(x[m:])
+        aucs[r] = (np.sum(tx[r, :]) - m * (m + 1) / 2.0) / (m * n)
+    v01 = np.var(np.sum(tx, axis=0) / m)
+    v10 = np.var(np.sum(ty, axis=0) / n)
+    return aucs, v01, v10
+
+
+def delong_roc_test(y_true: np.ndarray, y_scores_a: np.ndarray, y_scores_b: np.ndarray) -> Dict[str, float]:
+    """Perform DeLong test for two correlated ROC AUCs and return p-value and AUCs.
+
+    Returns dict with keys: auc_a, auc_b, z, pvalue
+    """
+    # Simple bootstrap-based test for AUC difference (robust fallback)
+    try:
+        from sklearn.metrics import roc_auc_score
+    except Exception:
+        raise RuntimeError('sklearn required for delong_roc_test')
+
+    y_true = np.asarray(y_true)
+    y_scores_a = np.asarray(y_scores_a)
+    y_scores_b = np.asarray(y_scores_b)
+
+    # compute observed AUCs
+    auc_a = float(roc_auc_score(y_true, y_scores_a))
+    auc_b = float(roc_auc_score(y_true, y_scores_b))
+
+    # bootstrap difference distribution
+    rng = np.random.RandomState(0)
+    n = len(y_true)
+    n_boot = 1000
+    diffs = []
+    for _ in range(n_boot):
+        idx = rng.randint(0, n, size=n)
+        try:
+            a = roc_auc_score(y_true[idx], y_scores_a[idx])
+            b = roc_auc_score(y_true[idx], y_scores_b[idx])
+            diffs.append(a - b)
+        except Exception:
+            continue
+    diffs = np.array(diffs)
+    if diffs.size < 2:
+        z = 0.0
+        pvalue = 1.0
+    else:
+        mean = diffs.mean()
+        std = diffs.std(ddof=1)
+        z = (auc_a - auc_b) / (std + 1e-12)
+        from scipy.stats import norm
+        pvalue = 2.0 * (1.0 - norm.cdf(abs(z)))
+
+    return {'auc_a': auc_a, 'auc_b': auc_b, 'z': float(z), 'pvalue': float(pvalue)}
+
+
+def bootstrap_auc_ci(y_true: np.ndarray, y_scores: np.ndarray, n_boot: int = 1000, alpha: float = 0.95, seed: Optional[int] = 0) -> Tuple[float, float]:
+    """Bootstrap confidence interval for AUC.
+
+    Returns (low, high) CI bounds.
+    """
+    try:
+        from sklearn.metrics import roc_auc_score
+    except Exception:
+        raise RuntimeError('sklearn required for bootstrap AUC CI')
+
+    rng = np.random.RandomState(seed)
+    y_true = np.asarray(y_true)
+    y_scores = np.asarray(y_scores)
+    n = len(y_true)
+    aucs = []
+    for _ in range(n_boot):
+        idx = rng.randint(0, n, size=n)
+        try:
+            auc = roc_auc_score(y_true[idx], y_scores[idx])
+        except Exception:
+            auc = np.nan
+        aucs.append(auc)
+    aucs = np.array(aucs)
+    aucs = aucs[~np.isnan(aucs)]
+    if aucs.size == 0:
+        return (float('nan'), float('nan'))
+    low = np.percentile(aucs, (1.0 - alpha) / 2.0 * 100)
+    high = np.percentile(aucs, (1.0 + alpha) / 2.0 * 100)
+    return float(low), float(high)
+
+
+
+
+
+def run_cross_site_experiment(index_csv: str, model_kwargs: Optional[Dict[str, Any]] = None, train_kwargs: Optional[Dict[str, Any]] = None, device: Union[str, torch.device] = 'cpu') -> Dict[str, Any]:
+    """Run a simple cross-site experiment: train on sites except one, test on held-out site.
+
+    Args:
+        index_csv: CSV index understood by PrecomputedConnectomeDataset
+        model_kwargs: kwargs for DDGModel
+        train_kwargs: training params (epochs, batch_size, lr)
+    Returns: results dictionary with metrics
+    """
+    model_kwargs = model_kwargs or {}
+    train_kwargs = train_kwargs or {}
+    epochs = int(train_kwargs.get('epochs', 10))
+    batch_size = int(train_kwargs.get('batch_size', 8))
+    lr = float(train_kwargs.get('lr', 1e-3))
+
+    ds = PrecomputedConnectomeDataset(index_csv)
+    train_idx, test_idx = cross_site_split(ds)
+    from torch.utils.data import Subset
+    ds_train = Subset(ds, train_idx)
+    ds_test = Subset(ds, test_idx)
+
+    dl_train = DataLoader(ds_train, batch_size=batch_size, shuffle=True, collate_fn=collate_batch)
+    dl_test = DataLoader(ds_test, batch_size=batch_size, shuffle=False, collate_fn=collate_batch)
+
+    device = torch.device(device)
+    model = DDGModel(**model_kwargs).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+
+    # simple training loop
+    for epoch in range(epochs):
+        model.train()
+        for batch in dl_train:
+            node_features = batch['node_features'].to(device)
+            adjacency_matrices = batch['adjacency_matrices'].to(device)
+            opt.zero_grad()
+            outputs, latent = model(node_features, adjacency_matrices, rollout_steps=1, teacher_forcing_prob=0.9)
+            loss, _ = compute_losses(batch, outputs, latent_sequence=latent)
+            loss.backward()
+            opt.step()
+
+    # Evaluation
+    model.eval()
+    y_true_all = []
+    y_pred_all = []
+    with torch.no_grad():
+        for batch in dl_test:
+            node_features = batch['node_features'].to(device)
+            adjacency_matrices = batch['adjacency_matrices'].to(device)
+            outputs, _ = model(node_features, adjacency_matrices, rollout_steps=1, teacher_forcing_prob=1.0)
+            preds = outputs[0]['predicted_score'].squeeze(-1).cpu().numpy()
+            y_pred_all.append(preds)
+            y_true_all.append(batch['cognitive_scores'].cpu().numpy())
+
+    y_pred = np.concatenate(y_pred_all)
+    y_true = np.concatenate(y_true_all)
+    results = {'mse': float(np.mean((y_true - y_pred)**2)), 'mae': float(np.mean(np.abs(y_true - y_pred)))}
+    # if binary labels present, compute ROC/AUC and bootstrap CI
+    if set(np.unique(y_true)) <= {0, 1}:
+        try:
+            from sklearn.metrics import roc_auc_score
+            auc = roc_auc_score(y_true, y_pred)
+            low, high = bootstrap_auc_ci(y_true, y_pred)
+            results['auc'] = float(auc)
+            results['auc_ci'] = (low, high)
+        except Exception:
+            pass
+
+    return results
+
+
+def run_ablation_suite(dataset_index_csv: str, save_path: Optional[str] = None, epochs: int = 10, batch_size: int = 8):
+    """Run ablation experiments using generate_ablation_configs and collect results.
+
+    Saves CSV to save_path (if provided) and returns list of dicts.
+    """
+    configs = generate_ablation_configs()
+    results = []
+    for cfg in configs:
+        model_cfg = {
+            'in_feats': 3,
+            'node_dim': 32,
+            'latent_dim': 12,
+            'use_edge_gru': cfg.get('use_edge_gru', False),
+            'use_gde': cfg.get('use_gde', False),
+            'use_adaptive_edges': cfg.get('use_adaptive_edges', False)
+        }
+        res = run_cross_site_experiment(dataset_index_csv, model_kwargs=model_cfg, train_kwargs={'epochs': epochs, 'batch_size': batch_size})
+        res_record = {'config': cfg, 'metrics': res}
+        results.append(res_record)
+
+    if save_path is not None:
+        import json
+        with open(save_path, 'w') as fh:
+            json.dump(results, fh, indent=2)
+    return results
+
+class StaticGraphBaseline(nn.Module):
+    # Baseline: Apply graph neural network to each timepoint independently, then RNN.
+
+    def __init__(self, in_features: int = 3, node_dim: int = 32, out_dim: int = 1):
+        super().__init__()
+        self.gat_layers = nn.ModuleList([
+            nn.Linear(in_features, node_dim),
+            nn.Linear(node_dim, node_dim)
+        ])
+        self.rnn = nn.LSTM(node_dim, 32, batch_first=True)
+        self.clinical_head = nn.Sequential(
+            nn.Linear(32, 16),
+            nn.ReLU(),
+            nn.Linear(16, out_dim)
+        )
+
+    def forward(self, node_features_sequence: torch.Tensor, adjacency_matrices_sequence: torch.Tensor) -> torch.Tensor:
+        # node_features_sequence: (B, T, N, F), adjacency_matrices_sequence: (B, T, N, N)
+        batch_size, num_timepoints, num_nodes, _ = node_features_sequence.shape
+
+        hidden_list = []
+        for t in range(num_timepoints):
+            features_t = node_features_sequence[:, t]  # (B, N, F)
+
+            # Simple GCN-like layers (ignoring adjacency for this simple baseline or assuming implicit)
+            # Note: Original code ignored adjacency in GAT layers (just linear), so keeping it consistent.
+            h_t = self.gat_layers[0](features_t)
+            h_t = torch.relu(h_t)
+            h_t = self.gat_layers[1](h_t)
+
+            h_pool = h_t.mean(dim=1)  # (B, node_dim)
+            hidden_list.append(h_pool)
+
+        hidden_sequence = torch.stack(hidden_list, dim=1)  # (B, T, node_dim)
+        out_rnn, (h_n, c_n) = self.rnn(hidden_sequence)
+
+        predicted_score = self.clinical_head(h_n[-1])  # (B, out_dim)
+        return predicted_score
+
+class FlatRNNBaseline(nn.Module):
+    # Baseline: Flatten connectome + features, pass through LSTM.
+
+    def __init__(self, num_nodes: int = 16, in_features: int = 3, out_dim: int = 1):
+        super().__init__()
+        flat_dim = num_nodes * num_nodes + num_nodes * in_features
+        self.lstm = nn.LSTM(flat_dim, 64, batch_first=True)
+        self.head = nn.Sequential(
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, out_dim)
+        )
+
+    def forward(self, node_features_sequence: torch.Tensor, adjacency_matrices_sequence: torch.Tensor) -> torch.Tensor:
+        batch_size, num_timepoints, num_nodes, num_features = node_features_sequence.shape
+
+        flattened_sequence = []
+        for t in range(num_timepoints):
+            adj_flat = adjacency_matrices_sequence[:, t].reshape(batch_size, -1)
+            feat_flat = node_features_sequence[:, t].reshape(batch_size, -1)
+            combined = torch.cat([adj_flat, feat_flat], dim=1)
+            flattened_sequence.append(combined)
+
+        flat_seq = torch.stack(flattened_sequence, dim=1)
+        out_rnn, (h_n, c_n) = self.lstm(flat_seq)
+
+        predicted_score = self.head(h_n[-1])
+        return predicted_score
+
+# ---------------------- Ablation plan generator ----------------------
+
+def generate_ablation_configs():
+    configs = []
+    base = {'use_gde': False, 'use_edge_gru': False, 'pretrain': True}
+    # ablate z_t
+    c1 = base.copy(); c1['use_z'] = False; configs.append(c1)
+    # ablate pretraining
+    c2 = base.copy(); c2['pretrain'] = False; configs.append(c2)
+    # ablate evolution function (PerEdgeMLP vs EdgeGRU)
+    c3 = base.copy(); c3['use_edge_gru'] = True; configs.append(c3)
+    # test GDE
+    c4 = base.copy(); c4['use_gde'] = True; configs.append(c4)
+    return configs
+
+# Add at the end before main
+
+def comprehensive_validation():
+    # Run full validation suite to ensure everything works correctly.
+    print('Running Comprehensive Validation Suite')
+    print('='*80)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    checks_passed = 0
+    checks_total = 0
+    model = None
+
+    # Check 1: Data loading
+    print('\nCheck 1: Data Loading')
+    checks_total += 1
+    try:
+        ds = SimulatedDDGDataset(num_subjects=10, num_regions=16, num_timepoints=6, seed=42)
+        dl = DataLoader(ds, batch_size=4, collate_fn=collate_batch)
+        batch = next(iter(dl))
+        assert batch['node_features'].shape == (4, 6, 16, 3), f"Features shape mismatch: {batch['node_features'].shape}"
+        assert batch['adjacency_matrices'].shape == (4, 6, 16, 16), f"Adjacency shape mismatch: {batch['adjacency_matrices'].shape}"
+        print('  Data loading: PASS')
+        checks_passed += 1
+    except Exception as e:
+        print(f'  Data loading: FAIL - {e}')
+
+    # Check 2: Model instantiation
+    print('\nCheck 2: Model Instantiation')
+    checks_total += 1
+    try:
+        model = DDGModel(in_feats=3, node_dim=32, latent_dim=12).to(device)
+        print(f'  Model parameters: {sum(p.numel() for p in model.parameters()):,}')
+        print('  Model instantiation: PASS')
+        checks_passed += 1
+    except Exception as e:
+        print(f'  Model instantiation: FAIL - {e}')
+
+    # Check 3: Forward pass
+    print('\nCheck 3: Forward Pass')
+    checks_total += 1
+    try:
+        if model is None:
+            raise RuntimeError('Model instantiation failed earlier')
+        model.eval()
+        with torch.no_grad():
+            node_features = torch.randn(4, 6, 16, 3).to(device)
+            adjacency_matrices = torch.randn(4, 6, 16, 16).to(device)
+            adjacency_matrices = F.softplus(adjacency_matrices)  # ensure non-negative
+            outputs, latent_sequence = model(node_features, adjacency_matrices, rollout_steps=2)
+        assert len(outputs) == 2, f"Expected 2 outputs, got {len(outputs)}"
+        assert latent_sequence.shape == (4, 6, 12), f"latent_sequence shape: {latent_sequence.shape}"
+        print('  Forward pass: PASS')
+        checks_passed += 1
+    except Exception as e:
+        print(f'  Forward pass: FAIL - {e}')
+
+    # Check 4: Loss computation
+    print('\nCheck 4: Loss Computation')
+    checks_total += 1
+    try:
+        batch_dict = {
+            'adjacency_matrices': F.softplus(torch.randn(4, 6, 16, 16)).to(device),
+            'cognitive_scores': torch.rand(4).to(device) * 30
+        }
+        loss, sublogs = compute_losses(batch_dict, outputs, latent_sequence=latent_sequence)
+        assert loss.item() > 0, f"Loss not positive: {loss.item()}"
+        print(f'  Loss breakdown: {sublogs}')
+        print('  Loss computation: PASS')
+        checks_passed += 1
+    except Exception as e:
+        print(f'  Loss computation: FAIL - {e}')
+
+    # Check 5: Interpretability functions
+    print('\nCheck 5: Interpretability Functions')
+    checks_total += 1
+    try:
+        adj_seq = [np.random.rand(16, 16) for _ in range(6)]
+        edge_imp, top_edges = compute_edge_importance(adj_seq, adj_seq)
+        assert edge_imp.shape == (16, 16), f"edge_imp shape: {edge_imp.shape}"
+        assert len(top_edges) > 0, "No top edges found"
+
+        node_str, degen_rate = compute_node_degeneration_rate(adj_seq)
+        assert node_str.shape == (16, 6), f"node_str shape: {node_str.shape}"
+        assert degen_rate.shape == (16,), f"degen_rate shape: {degen_rate.shape}"
+        print('  Interpretability: PASS')
+        checks_passed += 1
+    except Exception as e:
+        print(f'  Interpretability: FAIL - {e}')
+
+    # Check 6: Diagonal masking
+    print('\nCheck 6: Diagonal Masking')
+    checks_total += 1
+    try:
+        model_masked = DDGModel(in_feats=3, node_dim=32, latent_dim=12).to(device)
+        model_masked.eval()
+        with torch.no_grad():
+            node_features = torch.randn(2, 6, 16, 3).to(device)
+            adjacency_matrices = F.softplus(torch.randn(2, 6, 16, 16)).to(device)
+            outputs, latent_sequence = model_masked(node_features, adjacency_matrices, rollout_steps=1)
+            adj_out = outputs[0]['predicted_adjacency']  # shape: (B, N, N)
+            # robust diagonal extraction that works for both batched and unbatched tensors
+            diag_vals = torch.diagonal(adj_out, dim1=-2, dim2=-1)  # shape: (B, N)
+            # pick first batch element for check
+            diag_first = diag_vals[0] if diag_vals.dim() == 2 else diag_vals
+            assert torch.allclose(diag_first, torch.zeros_like(diag_first), atol=1e-5), "Diagonal not masked!"
+        print('  Diagonal masking: PASS')
+        checks_passed += 1
+    except Exception as e:
+        print(f'  Diagonal masking: FAIL - {e}')
+
+    print('\n' + '='*80)
+    print(f'Validation Summary: {checks_passed}/{checks_total} checks passed')
+    if checks_passed == checks_total:
+        print('All validation checks PASSED!')
+    else:
+        print(f'{checks_total - checks_passed} checks FAILED')
+    print('='*80)
+
+    return checks_passed == checks_total
+
+# ---------------------- Neural ODE longitudinal GNN & utilities ----------------------
+
+class ADNILongitudinalDataset(torch.utils.data.Dataset):
+    """Subject-level longitudinal dataset for ADNI-derived ROI features.
+
+    Each subject folder should contain:
+      - times.npy             (T,) timestamps (days or years)
+      - node_features.npy     (T, N, F)
+      - edge_index.npy        (2, E) static edge_index OR per-time (T, N, N) adjacency
+      - label.npy             (1,) scalar label (e.g., diagnosis 0/1)
+
+    The dataset returns dicts with keys: 'x' (T,N,F), 'times' (T,), 'edge_index' or 'adj', 'y' (scalar)
+    """
+
+    def __init__(self, root: str, subjects=None, time_unit: str = 'years', zscore: bool = True):
+        self.root = root
+        self.subjects = subjects if subjects is not None else sorted([d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))])
+        self.time_unit = time_unit
+        self.zscore = zscore
+
+    def __len__(self):
+        return len(self.subjects)
+
+    def _load_subject(self, subject_dir: str):
+        d = os.path.join(self.root, subject_dir)
+        times = np.load(os.path.join(d, 'times.npy'))
+        x = np.load(os.path.join(d, 'node_features.npy'))  # T x N x F
+        edge_path = os.path.join(d, 'edge_index.npy')
+        adj_path = os.path.join(d, 'adjacency.npy')
+        if os.path.exists(edge_path):
+            edge_index = np.load(edge_path)
+            # ensure int dtype
+            edge_index = edge_index.astype(np.int64)
+            edge_index = torch.tensor(edge_index, dtype=torch.long)
+            adj = None
+        elif os.path.exists(adj_path):
+            adj = np.load(adj_path)
+            edge_index = None
+        else:
+            raise FileNotFoundError(f'No edge_index.npy or adjacency.npy in {d}')
+
+        label = np.load(os.path.join(d, 'label.npy'))
+        # unit conversion
+        if self.time_unit == 'days':
+            times = times / 365.25
+
+        if self.zscore:
+            mean = x.mean(axis=(0, 1), keepdims=True)
+            std = x.std(axis=(0, 1), keepdims=True) + 1e-6
+            x = (x - mean) / std
+
+        return torch.tensor(x, dtype=torch.float32), torch.tensor(times, dtype=torch.float32), edge_index, (torch.tensor(adj, dtype=torch.float32) if adj is not None else None), torch.tensor(label, dtype=torch.float32)
+
+    def __getitem__(self, idx: int):
+        sub = self.subjects[idx]
+        x, times, edge_index, adj, y = self._load_subject(sub)
+        return { 'x': x, 'times': times, 'edge_index': edge_index, 'adj': adj, 'y': y }
+
+
+def collate_longitudinal(batch):
+    """Collate list of subject dicts into a batch dict; keeps variable-length times as lists."""
+    xs = [b['x'] for b in batch]
+    times = [b['times'] for b in batch]
+    edges = [b['edge_index'] for b in batch]
+    adjs = [b['adj'] for b in batch]
+    ys = torch.stack([b['y'] for b in batch]).squeeze()
+    return { 'x': xs, 'times': times, 'edge_index': edges, 'adj': adjs, 'y': ys }
+
+
+# Lightweight guarded imports for graph layers and ODE integration
+_try_tg = True
+_try_torchdiffeq = True
+_try_captum = True
+try:
+    from torch_geometric.nn import GCNConv, global_mean_pool
+except Exception:
+    _try_tg = False
+    # define a fallback GCN-like layer (dense adjacency matmul)
+    class GCNConv(torch.nn.Module):
+        def __init__(self, in_channels, out_channels):
+            super().__init__()
+            self.lin = torch.nn.Linear(in_channels, out_channels)
+        def forward(self, x, edge_index=None, adj=None):
+            # x: (N, F) if adj provided: (N,N)
+            if adj is not None:
+                agg = adj @ x
+            else:
+                agg = x
+            return self.lin(agg)
+    def global_mean_pool(x, batch=None):
+        return x.mean(dim=0, keepdim=True)
+
+# Prefer torchdiffeq when available, otherwise provide a lightweight RK4 integrator fallback
+try:
+    from torchdiffeq import odeint  # type: ignore
+    _try_torchdiffeq = True
+except Exception:
+    _try_torchdiffeq = False
+
+    def odeint(func, y0, t, method: str = 'rk4', rtol: float = 1e-5, atol: float = 1e-6, **kwargs):
+        """Fallback RK4-style integrator for small tests and debugging.
+
+        Note: This is not a production-quality ODE solver. For real training use
+        `torchdiffeq.odeint` which is more accurate and efficient.
+        """
+        # ensure times is 1D numpy
+        if isinstance(t, torch.Tensor):
+            t_np = t.detach().cpu().numpy()
+        else:
+            t_np = np.asarray(t)
+        device = y0.device if isinstance(y0, torch.Tensor) else None
+        ys = []
+        y = y0
+        ys.append(y)
+        for i in range(len(t_np) - 1):
+            t0 = float(t_np[i])
+            t1 = float(t_np[i + 1])
+            dt = t1 - t0
+            # simple RK4 single-step on interval [t0, t1]
+            k1 = func(t0, y)
+            k2 = func(t0 + dt / 2.0, y + 0.5 * dt * k1)
+            k3 = func(t0 + dt / 2.0, y + 0.5 * dt * k2)
+            k4 = func(t0 + dt, y + dt * k3)
+            y = y + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+            ys.append(y)
+        # convert list to tensor returning (T, N, H)
+        return torch.stack([yy if isinstance(yy, torch.Tensor) else torch.tensor(yy, dtype=torch.float32, device=device) for yy in ys], dim=0)
+        out = torch.stack(ys, dim=0)
+        return out
+
+try:
+    from captum.attr import IntegratedGradients
+except Exception:
+    _try_captum = False
+
+
+class GraphODEFunc(torch.nn.Module):
+    """Graph-parameterized ODE function f(h, A, t) that returns dh/dt.
+
+    This module explicitly models the instantaneous dynamics of node embeddings
+    using graph convolutions (or a dense matmul fallback). It accepts time `t`
+    as an argument so time-dependent dynamics can be added easily.
+
+    dh/dt = f(h, A, t)
+    """
+    def __init__(self, hidden_dim: int, edge_index=None, adj=None, dropout: float = 0.0, use_batchnorm: bool = False, time_embed: bool = False):
+        super().__init__()
+        self.gc1 = GCNConv(hidden_dim, hidden_dim)
+        self.gc2 = GCNConv(hidden_dim, hidden_dim)
+        self.act = torch.nn.ReLU()
+        self.edge_index = edge_index
+        self.adj = adj
+        self.dropout = torch.nn.Dropout(dropout) if dropout > 0 else None
+        self.use_batchnorm = use_batchnorm
+        self.time_embed = time_embed
+        if use_batchnorm:
+            try:
+                # torch_geometric / dense fallbacks both use torch.nn.BatchNorm1d
+                self.bn1 = torch.nn.BatchNorm1d(hidden_dim)
+                self.bn2 = torch.nn.BatchNorm1d(hidden_dim)
+            except Exception:
+                self.bn1 = None
+                self.bn2 = None
+        if time_embed:
+            # small time embedding MLP: scalar t -> vector
+            self.t2 = torch.nn.Sequential(torch.nn.Linear(1, hidden_dim), torch.nn.Tanh())
+
+    def forward(self, t, h):
+        # h: (N, H)
+        # incorporate optional time embedding by adding it to node embeddings
+        if self.time_embed:
+            te = self.t2(torch.tensor([[float(t)]], device=h.device).float()).squeeze(0)  # (H,)
+            h = h + te
+        if _try_tg:
+            out = self.gc1(h, self.edge_index)
+            if self.use_batchnorm and self.bn1 is not None:
+                out = self.bn1(out)
+            out = self.act(out)
+            if self.dropout is not None:
+                out = self.dropout(out)
+            out = self.gc2(out, self.edge_index)
+            if self.use_batchnorm and self.bn2 is not None:
+                out = self.bn2(out)
+        else:
+            out = self.gc1(h, edge_index=None, adj=self.adj)
+            if self.use_batchnorm and self.bn1 is not None:
+                out = self.bn1(out)
+            out = self.act(out)
+            if self.dropout is not None:
+                out = self.dropout(out)
+            out = self.gc2(out, edge_index=None, adj=self.adj)
+            if self.use_batchnorm and self.bn2 is not None:
+                out = self.bn2(out)
+        return out
+
+
+class ODEBlock(torch.nn.Module):
+    def __init__(self, odefunc: GraphODEFunc, method: str = 'rk4', rtol: float = 1e-5, atol: float = 1e-6, require_torchdiffeq: bool = False):
+        """Integrate a GraphODEFunc over specified time points.
+
+        Args:
+            odefunc: instance of GraphODEFunc or compatible callable
+            method: integration method (e.g., 'rk4' or method supported by torchdiffeq)
+            rtol, atol: relative and absolute tolerances forwarded to torchdiffeq.odeint when available
+            require_torchdiffeq: if True, raise ImportError when torchdiffeq is not installed
+        """
+        super().__init__()
+        self.odefunc = odefunc
+        self.method = method
+        self.rtol = rtol
+        self.atol = atol
+        self.require_torchdiffeq = require_torchdiffeq
+
+    def forward(self, h0: torch.Tensor, times: torch.Tensor):
+        # times: (T,) increasing
+        if self.require_torchdiffeq and (not _try_torchdiffeq):
+            raise RuntimeError('torchdiffeq is required for require_torchdiffeq=True')
+        # Forward integration; pass tolerances for solvers that accept them
+        out = odeint(self.odefunc, h0, times, method=self.method, rtol=self.rtol, atol=self.atol)
+        return out  # (T, N, H)
+
+
+class NeuralODEGNN(torch.nn.Module):
+    """Combines spatial GNN with continuous-time Neural ODE for longitudinal modeling.
+
+    Includes dropout and optional batch normalization for better generalization.
+    """
+    def __init__(self, in_channels: int, hidden_dim: int = 64, num_classes: int = 1, dropout: float = 0.0, use_batchnorm: bool = False):
+        super().__init__()
+        self.input_proj = torch.nn.Linear(in_channels, hidden_dim)
+        self.input_bn = torch.nn.BatchNorm1d(hidden_dim) if use_batchnorm else None
+        self.dropout = torch.nn.Dropout(dropout) if dropout > 0 else None
+        self.odefunc = None
+        self.odeblock = None
+        # classifier with dropout
+        self.classifier = torch.nn.Sequential(
+            torch.nn.Linear(hidden_dim, max(hidden_dim // 2, 8)),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout) if dropout > 0 else torch.nn.Identity(),
+            torch.nn.Linear(max(hidden_dim // 2, 8), num_classes)
+        )
+        self._dropout_rate = dropout
+        self._use_batchnorm = use_batchnorm
+
+    def set_edge_index(self, edge_index=None, adj=None, time_embed: bool = False, require_torchdiffeq: bool = False, ode_method: str = 'rk4'):
+        # allows static topologies or precomputed dense adjacency
+        self.odefunc = GraphODEFunc(self.input_proj.out_features, edge_index=edge_index, adj=adj, dropout=self._dropout_rate, use_batchnorm=self._use_batchnorm, time_embed=time_embed)
+        self.odeblock = ODEBlock(self.odefunc, method=ode_method, require_torchdiffeq=require_torchdiffeq)
+
+    def forward(self, x_time: torch.Tensor, times: torch.Tensor, batch=None):
+        # x_time: (T, N, F)  times: (T,)
+        T, N, F = x_time.shape
+        x0 = x_time[0]
+        h0 = self.input_proj(x0)  # (N, H)
+        if self.input_bn is not None:
+            # BatchNorm1d expects shape (N, H)
+            h0 = self.input_bn(h0)
+        if self.dropout is not None:
+            h0 = self.dropout(h0)
+        if self.odeblock is None:
+            raise RuntimeError('Edge index or adjacency must be set via set_edge_index before forward')
+        h_ts = self.odeblock(h0, times)
+        h_last = h_ts[-1]
+        pooled = global_mean_pool(h_last, batch=batch)
+        out = self.classifier(pooled)
+        return out.squeeze()
+
+    def predict_proba(self, x_time: torch.Tensor, times: torch.Tensor, batch=None):
+        self.eval()
+        with torch.no_grad():
+            logits = self.forward(x_time, times, batch=batch)
+            return torch.sigmoid(logits)
+
+
+def augment_time_series(x_time: torch.Tensor, noise_std: float = 0.01, time_jitter: float = 0.0):
+    """Simple augmentation: additive gaussian noise and optional small timepoint jitter (interpolation not implemented here).
+
+    This keeps augmentation lightweight and safe for continuous-time modeling.
+    """
+    out = x_time.clone()
+    if noise_std > 0:
+        out = out + torch.randn_like(out) * noise_std
+    # time_jitter could be implemented by resampling/interpolation; keep as placeholder for extensibility
+    return out
+
+
+
+# ---------------------- Encoder / Decoder / Connectivity utilities ----------------------
+
+class RNNEncoder(torch.nn.Module):
+    """Per-node RNN encoder that maps (T, N, F) -> (N, hidden_dim*). Produces mu and logvar per node."""
+    def __init__(self, in_features: int, hidden_dim: int = 64, rnn_hidden: int = 64, num_layers: int = 1, bidirectional: bool = False):
+        super().__init__()
+        self.in_features = in_features
+        self.hidden_dim = hidden_dim
+        self.rnn_hidden = rnn_hidden
+        self.num_layers = num_layers
+        self.bidirectional = bidirectional
+        self.gru = torch.nn.GRU(in_features, rnn_hidden, num_layers=num_layers, batch_first=True, bidirectional=bidirectional)
+        rnn_out = rnn_hidden * (2 if bidirectional else 1)
+        self.mu = torch.nn.Linear(rnn_out, hidden_dim)
+        self.logvar = torch.nn.Linear(rnn_out, hidden_dim)
+
+    def forward(self, x_time: torch.Tensor):
+        # x_time: (T, N, F)
+        T, N, F = x_time.shape
+        # process per-node sequence: make (N, T, F)
+        x = x_time.permute(1, 0, 2).contiguous()
+        out, h_n = self.gru(x)  # out: (N, T, rnn_out)
+        last = out[:, -1, :]
+        mu = self.mu(last)
+        logvar = self.logvar(last)
+        return mu, logvar
+
+
+class Decoder(torch.nn.Module):
+    """Decoder mapping latent node embeddings over time to reconstructed node features.
+
+    Applies a shared MLP to node embeddings at each timepoint.
+    """
+    def __init__(self, hidden_dim: int, out_features: int, hidden_layers: int = 1):
+        super().__init__()
+        layers = []
+        cur = hidden_dim
+        for i in range(hidden_layers):
+            layers.append(torch.nn.Linear(cur, cur))
+            layers.append(torch.nn.ReLU())
+        layers.append(torch.nn.Linear(cur, out_features))
+        self.net = torch.nn.Sequential(*layers)
+
+    def forward(self, H_ts: torch.Tensor):
+        # H_ts: (T, N, H) -> output: (T, N, F)
+        T, N, H = H_ts.shape
+        x = H_ts.view(T * N, H)
+        out = self.net(x)
+        return out.view(T, N, -1)
+
+
+class ConnectivityCombiner(torch.nn.Module):
+    """Combine multiple connectivity matrices with learnable positive weights.
+
+    Accepts a list of adjacency matrices (dense NxN). Returns weighted combination.
+    """
+    def __init__(self, n_measures: int = 3):
+        super().__init__()
+        self.logits = torch.nn.Parameter(torch.zeros(n_measures))
+
+    def forward(self, adjs: list):
+        # adjs: list of (N, N) arrays/tensors
+        weights = torch.softmax(self.logits, dim=0)
+        device = adjs[0].device if isinstance(adjs[0], torch.Tensor) else None
+        out = 0.0
+        for w, a in zip(weights, adjs):
+            a_t = a if isinstance(a, torch.Tensor) else torch.tensor(a, dtype=torch.float32, device=device)
+            out = out + w * a_t
+        return out
+
+
+class EdgeAttention(torch.nn.Module):
+    """Compute probabilistic edge importance PA from node embeddings.
+
+    Produces values in (0,1) for each potential edge (dense NxN).
+    """
+    def __init__(self, node_dim: int, hidden: int = 32):
+        super().__init__()
+        self.fc = torch.nn.Sequential(torch.nn.Linear(2 * node_dim, hidden), torch.nn.ReLU(), torch.nn.Linear(hidden, 1))
+
+    def forward(self, H: torch.Tensor):
+        # H: (N, D) -> PA: (N, N)
+        N, D = H.shape
+        # compute pairwise concatenations efficiently
+        H_i = H.unsqueeze(1).repeat(1, N, 1)  # (N, N, D)
+        H_j = H.unsqueeze(0).repeat(N, 1, 1)  # (N, N, D)
+        pair = torch.cat([H_i, H_j], dim=-1)  # (N, N, 2D)
+        out = self.fc(pair.view(N * N, 2 * D)).view(N, N)
+        PA = torch.sigmoid(out)
+        return PA
+
+
+class MINE(torch.nn.Module):
+    """A small MINE-like mutual information estimator for masks and labels.
+
+    Usage: estimate = mine.estimate(mask_flat, labels)
+    """
+    def __init__(self, input_dim: int, hidden: int = 128):
+        super().__init__()
+        self.net = torch.nn.Sequential(torch.nn.Linear(input_dim + 1, hidden), torch.nn.ReLU(), torch.nn.Linear(hidden, 1))
+
+    def forward(self, mask, labels):
+        # mask: (B, D), labels: (B,1) or (B,)
+        if labels.dim() == 1:
+            labels = labels.unsqueeze(1)
+        x = torch.cat([mask, labels], dim=1)
+        return self.net(x).squeeze(-1)
+
+    def estimate(self, mask, labels):
+        # simple Donsker-Varadhan lower bound estimate (biased):
+        T = self.forward(mask, labels)
+        # shuffle labels for marginal
+        idx = torch.randperm(labels.size(0))
+        T_m = self.forward(mask, labels[idx])
+        mi = T.mean() - torch.log(torch.exp(T_m).mean() + 1e-8)
+        return mi
+
+
+class NodePX(torch.nn.Module):
+    """Per-node-per-feature importance module PX: maps node embeddings -> (N, F) mask.
+
+    Produces probabilities in (0,1). Also provides entropy and sparsity computations.
+    """
+    def __init__(self, node_dim: int, out_features: int):
+        super().__init__()
+        self.lin = torch.nn.Linear(node_dim, out_features)
+
+    def forward(self, H: torch.Tensor):
+        # H: (N, D) -> PX: (N, F)
+        out = self.lin(H)  # (N, F)
+        PX = torch.sigmoid(out)
+        return PX
+
+    @staticmethod
+    def entropy(PX: torch.Tensor, eps: float = 1e-8):
+        # binary entropy per entry: -p log p - (1-p) log(1-p)
+        e = -PX * torch.log(PX + eps) - (1.0 - PX) * torch.log(1.0 - PX + eps)
+        return e.mean()
+
+    @staticmethod
+    def sparsity(PX: torch.Tensor):
+        # L1 mean encourages sparsity across entries
+        return PX.abs().mean()
+
+
+# ---------------------- VAE-style Neural ODE longitudinal model ----------------------
+
+class NeuralODEVAEGNN(torch.nn.Module):
+    """VAE-style Neural ODE GNN that encodes sequences into initial latent H0 and integrates.
+
+    - Encoder: RNN per node -> q(H0)=N(mu, sigma)
+    - ODE: integrates H0 to H(t)
+    - Decoder: reconstructs node features x_hat(t) from H(t)
+    - Attention & importance masks: PA (edges) and PX (node-feature masks)
+    """
+    def __init__(self, in_features: int, hidden_dim: int = 64, decoder_hidden_layers: int = 1, dropout: float = 0.1, use_batchnorm: bool = True, use_mine: bool = False):
+        super().__init__()
+        self.encoder = RNNEncoder(in_features, hidden_dim)
+        self.decoder = Decoder(hidden_dim, in_features, hidden_layers=decoder_hidden_layers)
+        self.hidden_dim = hidden_dim
+        self.in_features = in_features
+        self.combiner = ConnectivityCombiner(n_measures=3)
+        self.edge_attention = EdgeAttention(node_dim=hidden_dim)
+        # per-node-per-feature importance module
+        self.px_module = NodePX(node_dim=hidden_dim, out_features=in_features)
+        self.classifier = torch.nn.Sequential(torch.nn.Linear(hidden_dim, hidden_dim // 2), torch.nn.ReLU(), torch.nn.Linear(hidden_dim // 2, 1))
+        self.use_mine = use_mine
+        if use_mine:
+            self.mine = MINE(input_dim=None if in_features is None else (1 * in_features), hidden=128)
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def _make_adj_func(self, times_tensor: torch.Tensor, adjs_list: list, PA=None):
+        # adjs_list: list of T x N x N adjacency tensors or (T, N, N) np arrays
+        # build nearest-neighbor function
+        times = times_tensor.cpu().numpy()
+        adjs_np = [ (a if isinstance(a, np.ndarray) else a.detach().cpu().numpy()) for a in adjs_list ]
+        def adj_func(t):
+            # pick nearest time index
+            idx = int(np.argmin(np.abs(times - float(t))))
+            A = torch.tensor(adjs_np[idx], dtype=torch.float32)
+            if PA is not None:
+                A = A * PA
+            return A
+        return adj_func
+
+    def forward(self, x_time: torch.Tensor, times: torch.Tensor, adjs_list: list = None, labels: torch.Tensor = None, return_dict: bool = True, beta: float = 1.0):
+        # x_time: (T, N, F)
+        T, N, F = x_time.shape
+        mu, logvar = self.encoder(x_time)
+        # mu/logvar: (N, H)
+        H0 = self.reparameterize(mu, logvar)
+        # set ODEFunc adj func
+        if adjs_list is None:
+            # fall back to using static adjacency from last observed time (dense)
+            adjs_list = [torch.eye(N, dtype=torch.float32) for _ in range(T)]
+        # create PA from H0
+        PA = self.edge_attention(H0)  # (N, N)
+        # create PX per-node-per-feature
+        PX = self.px_module(H0)  # (N, F)
+        # attach graph-parameterized ODE function (ensures dh/dt = f(h, A, t))
+        gfunc = GraphODEFunc(self.hidden_dim, edge_index=None, adj=None, dropout=0.0, use_batchnorm=False, time_embed=False)
+        gfunc.adj_func = self._make_adj_func(times, adjs_list, PA=PA)
+        odeblock = ODEBlock(gfunc)
+        H_ts = odeblock(H0, times)  # (T, N, H)
+        # reconstruct
+        X_hat = self.decoder(H_ts)  # (T, N, F)
+        # apply PX to emphasize important features
+        X_hat_masked = X_hat * PX.unsqueeze(0)  # broadcast over time
+        # compute losses: recon MSE and KL
+        recon_loss = torch.nn.functional.mse_loss(X_hat_masked, x_time * PX.unsqueeze(0))
+        kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+        # classifier on last time
+        h_last = H_ts[-1]
+        pooled = h_last.mean(dim=0, keepdim=True)
+        logits = self.classifier(pooled).squeeze()
+
+        # regularizers for PX
+        sparsity_loss = NodePX.sparsity(PX)
+        entropy_loss = NodePX.entropy(PX)
+
+        # optional mutual information estimate between flattened PX and labels
+        mi_est = None
+        if self.use_mine and labels is not None:
+            # flatten PX to (N*F,) then tile to batch if needed; for single-subject case create (1, D)
+            mask_flat = PX.view(1, -1)
+            lab = labels.view(-1) if labels is not None else torch.tensor([0.0])
+            if lab.dim() == 0:
+                lab = lab.unsqueeze(0)
+            mi_est = self.mine.estimate(mask_flat, lab)
+
+        if return_dict:
+            return {
+                'logits': logits,
+                'recon': recon_loss,
+                'kl': kl,
+                'PA': PA.detach().cpu().numpy(),
+                'PX': PX.detach().cpu().numpy(),
+                'sparsity_loss': sparsity_loss.detach().cpu().item(),
+                'entropy_loss': entropy_loss.detach().cpu().item(),
+                'mi_est': None if mi_est is None else float(mi_est.detach().cpu().item()),
+                'mu': mu,
+                'logvar': logvar
+            }
+        return logits
+
+# ---------------------- VAE training helper ----------------------
+
+def train_longitudinal_vae(model: NeuralODEVAEGNN, dataloader, optimizer, device='cpu', beta: float = 1.0, px_sparsity_weight: float = 0.0, px_entropy_weight: float = 0.0, mine_weight: float = 0.0):
+    """Train a single epoch for the VAE-style Neural ODE model.
+
+    Each batch is expected to be a list of subject dicts with keys: 'x', 'times', 'adjs'(optional), 'y'.
+    Regularizers weights control the contribution of PX sparsity and entropy, and optional MINE MI loss.
+    """
+    model.train()
+    total = {'recon': 0.0, 'kl': 0.0, 'cls': 0.0, 'sparsity': 0.0, 'entropy': 0.0, 'mi': 0.0}
+    loss_fn = torch.nn.BCEWithLogitsLoss()
+    n = 0
+    for batch in dataloader:
+        subjects = batch  # if dataloader yields lists
+        optimizer.zero_grad()
+        batch_loss = 0.0
+        for s in subjects:
+            x = s['x'].to(device)  # (T,N,F)
+            times = s['times'].to(device)
+            adjs = s.get('adjs', None)
+            y = s['y'].to(device)
+            res = model(x, times, adjs, labels=y, return_dict=True, beta=beta)
+            recon = res['recon']
+            kl = res['kl']
+            logits = res['logits']
+            sparsity = res['sparsity_loss']
+            entropy = res['entropy_loss']
+            mi_est = res.get('mi_est', None)
+
+            cls_loss = loss_fn(logits.unsqueeze(0), y.unsqueeze(0))
+            reg = px_sparsity_weight * sparsity + px_entropy_weight * entropy
+            if mine_weight > 0 and mi_est is not None:
+                reg = reg - mine_weight * mi_est  # maximize MI (subtract to maximize)
+
+            loss = recon + beta * kl + cls_loss + reg
+            loss.backward()
+            batch_loss += loss.item()
+            total['recon'] += float(recon.detach().cpu().item())
+            total['kl'] += float(kl.detach().cpu().item())
+            total['cls'] += float(cls_loss.detach().cpu().item())
+            total['sparsity'] += float(sparsity)
+            total['entropy'] += float(entropy)
+            total['mi'] += float(mi_est) if mi_est is not None else 0.0
+            n += 1
+        optimizer.step()
+    for k in total:
+        total[k] /= max(1, n)
+    return total
+
+# -----------------------------------------------------------------------------
+# Interpretability utilities (kept after these new modules)
+# -----------------------------------------------------------------------------
+
+# Interpretability utilities
+
+def integrated_gradients_over_time(model: torch.nn.Module, x_time: torch.Tensor, times: torch.Tensor, target: int = 0, baselines=None, n_steps: int = 50):
+    """Compute Integrated Gradients across timepoints for node features.
+
+    Returns numpy array (T, N, F)
+    """
+    if not _try_captum:
+        raise RuntimeError('captum is required for Integrated Gradients (pip install captum)')
+    if baselines is None:
+        baselines = torch.zeros_like(x_time)
+
+    T, N, F = x_time.shape
+    ig = IntegratedGradients(lambda inp: model(inp, times))
+    attributions = []
+    for t_idx in range(T):
+        def wrapper(x_slice):
+            xt = x_time.clone()
+            xt[t_idx] = x_slice
+            return model(xt, times)
+        ig_local = IntegratedGradients(wrapper)
+        at = ig_local.attribute(x_time[t_idx].unsqueeze(0), baselines=baselines[t_idx].unsqueeze(0), target=target, n_steps=n_steps)
+        attributions.append(at.squeeze(0).detach().cpu().numpy())
+    return np.stack(attributions, axis=0)
+
+
+def explain_snapshot_with_gnnexplainer(model: torch.nn.Module, snapshot_x: torch.Tensor, edge_index, epochs: int = 100):
+    """Use torch-geometric's GNNExplainer for a single snapshot to get node/edge masks."""
+    if not _try_tg:
+        raise RuntimeError('torch-geometric is required for GNNExplainer usage')
+    try:
+        from torch_geometric.nn import GNNExplainer
+    except Exception:
+        raise RuntimeError('GNNExplainer import failed')
+    explainer = GNNExplainer(model, epochs=epochs)
+    node_feat_mask, edge_mask = explainer.explain_graph(snapshot_x, edge_index)
+    return node_feat_mask.detach().cpu().numpy(), edge_mask.detach().cpu().numpy()
+
+
+# --- Interpretability helpers: explicit APIs for node/edge importance, saliency & simulation ---
+
+
+def node_importance_scores(model: torch.nn.Module, x_time: torch.Tensor, times: torch.Tensor, method: str = 'px', target: int = 0):
+    """Compute per-node importance scores.
+
+    Methods:
+      - 'px': use per-node-per-feature PX if model exposes it (VAE returns 'PX') and aggregate over features
+      - 'gradient': compute abs gradient of scalar target w.r.t. input and aggregate over time+features
+      - 'ig': integrated gradients over time (requires captum)
+
+    Returns:
+      node_scores: numpy array (N,) with non-negative importance scores
+    """
+    model.eval()
+    device = x_time.device
+    if method == 'px':
+        # try to get PX from a forward if supported
+        try:
+            out = model(x_time, times, return_dict=True)
+            PX = out.get('PX', None)
+            if PX is not None:
+                # PX is (N, F)
+                return np.asarray(PX.mean(axis=1))
+        except Exception:
+            pass
+        # fallback to gradient
+        method = 'gradient'
+
+    if method == 'ig':
+        if not _try_captum:
+            raise RuntimeError('captum required for integrated gradients')
+        at = integrated_gradients_over_time(model, x_time.detach(), times.detach(), target=target)
+        # at: (T, N, F) -> aggregate across time and features
+        node_scores = np.sum(np.abs(at), axis=(0, 2))
+        return node_scores
+
+    # gradient-based: scalarize and compute gradients
+    x = x_time.clone().detach().requires_grad_(True)
+    # forward
+    out = model(x, times)
+    if isinstance(out, dict):
+        logits = out.get('logits', None)
+        if logits is None:
+            # try recon loss as scalar
+            logits = out.get('recon', torch.tensor(0.0, device=device))
+    else:
+        logits = out
+    # scalar target
+    if torch.is_tensor(logits):
+        scalar = logits if logits.dim() == 0 else logits.sum()
+    else:
+        scalar = torch.tensor(float(logits), device=device)
+    grads = torch.autograd.grad(scalar, x, allow_unused=True)[0]
+    if grads is None:
+        # fallback: zeros
+        return np.zeros(x_time.shape[1], dtype=float)
+    # aggregate across time and features
+    node_scores = grads.abs().sum(dim=(0, 2)).detach().cpu().numpy()
+    return node_scores
+
+
+def edge_attribution_via_pa(model: NeuralODEVAEGNN, x_time: torch.Tensor, times: torch.Tensor, adjs_list: list = None, use_abs: bool = True):
+    """Compute edge attribution scores by computing gradient of model logit wrt learned PA.
+
+    This currently supports `NeuralODEVAEGNN` which exposes `encoder` and `edge_attention`.
+    Returns numpy array (N, N) with importance scores.
+    """
+    if not isinstance(model, NeuralODEVAEGNN):
+        # best-effort: try GNNExplainer if torch_geometric is available
+        if _try_tg:
+            try:
+                node_mask, edge_mask = explain_snapshot_with_gnnexplainer(model, x_time[-1], None)
+                # edge_mask is 1D of length num_edges; return None-shaped placeholder
+                return edge_mask
+            except Exception:
+                return None
+        return None
+
+    model.eval()
+    with torch.enable_grad():
+        mu, logvar = model.encoder(x_time)
+        H0 = mu  # deterministic for attribution
+        PA = model.edge_attention(H0)
+        PA = PA.clone().detach().requires_grad_(True)
+        PX = model.px_module(H0)  # (N, F) but we don't need grads for it here
+        # build adj func
+        if adjs_list is None:
+            adjs_list = [torch.eye(x_time.shape[1], dtype=torch.float32) for _ in range(x_time.shape[0])]
+        odefunc = ODEFunc(model.hidden_dim, edge_index=None, adj=None)
+        odefunc.adj_func = model._make_adj_func(times, adjs_list, PA=PA)
+        odeblock = ODEBlock(odefunc)
+        H_ts = odeblock(H0, times)
+        X_hat = model.decoder(H_ts) * PX.unsqueeze(0)
+        h_last = H_ts[-1]
+        pooled = h_last.mean(dim=0, keepdim=True)
+        logits = model.classifier(pooled).squeeze()
+        scalar = logits if logits.dim() == 0 else logits.sum()
+        grads = torch.autograd.grad(scalar, PA, retain_graph=False, allow_unused=True)[0]
+        if grads is None:
+            return None
+        scores = grads.abs().detach().cpu().numpy() if use_abs else grads.detach().cpu().numpy()
+        return scores
+
+
+def roi_saliency_over_time(model: torch.nn.Module, x_time: torch.Tensor, times: torch.Tensor, target: int = 0):
+    """Return saliency map over ROIs across time: shape (T, N).
+
+    Uses gradient of scalar target w.r.t. input and aggregates abs grads across features.
+    """
+    model.eval()
+    x = x_time.clone().detach().requires_grad_(True)
+    out = model(x, times)
+    logits = out['logits'] if isinstance(out, dict) and 'logits' in out else out
+    scalar = logits if torch.is_tensor(logits) and logits.dim() == 0 else (logits.sum() if torch.is_tensor(logits) else torch.tensor(float(logits)))
+    grads = torch.autograd.grad(scalar, x, allow_unused=True)[0]
+    if grads is None:
+        return np.zeros((x_time.shape[0], x_time.shape[1]), dtype=float)
+    saliency = grads.abs().sum(dim=-1).detach().cpu().numpy()
+    return saliency
+
+
+def simulate_time_evolution(model: NeuralODEVAEGNN, x_time: torch.Tensor, times: torch.Tensor, sim_times: Union[np.ndarray, List[float]], adjs_list: list = None, deterministic: bool = True):
+    """Simulate time evolution (reconstructions + logits) at arbitrary `sim_times`.
+
+    Works for `NeuralODEVAEGNN` by using encoder->H0->ODEBlock->decoder flow. Returns dict with keys:
+      - 'X_hat': (T_sim, N, F)
+      - 'H_ts': (T_sim, N, H)
+      - 'logits': scalar or array depending on model
+      - 'PA': (N, N)
+      - 'PX': (N, F)
+    """
+    if not isinstance(model, NeuralODEVAEGNN):
+        raise RuntimeError('simulate_time_evolution currently supports NeuralODEVAEGNN')
+    model.eval()
+    device = x_time.device
+    sim_times = np.array(sim_times, dtype=float)
+    with torch.no_grad():
+        mu, logvar = model.encoder(x_time)
+        H0 = mu if deterministic else model.reparameterize(mu, logvar)
+        if adjs_list is None:
+            adjs_list = [torch.eye(x_time.shape[1], dtype=torch.float32) for _ in range(x_time.shape[0])]
+        PA = model.edge_attention(H0)
+        PX = model.px_module(H0)
+        odefunc = ODEFunc(model.hidden_dim, edge_index=None, adj=None)
+        odefunc.adj_func = model._make_adj_func(torch.tensor(sim_times, dtype=torch.float32), adjs_list, PA=PA)
+        odeblock = ODEBlock(odefunc)
+        H_ts = odeblock(H0, torch.tensor(sim_times, dtype=torch.float32))
+        X_hat = model.decoder(H_ts) * PX.unsqueeze(0)
+        h_last = H_ts[-1]
+        pooled = h_last.mean(dim=0, keepdim=True)
+        logits = model.classifier(pooled).squeeze()
+    return {
+        'X_hat': X_hat.detach().cpu().numpy(),
+        'H_ts': H_ts.detach().cpu().numpy(),
+        'logits': logits.detach().cpu().item() if torch.is_tensor(logits) and logits.dim() == 0 else (logits.detach().cpu().numpy() if torch.is_tensor(logits) else logits),
+        'PA': PA.detach().cpu().numpy(),
+        'PX': PX.detach().cpu().numpy()
+    }
+
+
+def simulate_subject_trajectories(model: NeuralODEVAEGNN, x_time: torch.Tensor, times: torch.Tensor, n_future: int = 3, dt: float = 1.0, deterministic: bool = True):
+    """Simulate simple subject-level trajectories extending `n_future` timepoints beyond observed `times`.
+
+    Returns same dict as `simulate_time_evolution` with sim_times that include observed times followed by future times.
+    """
+    last = float(times[-1].detach().cpu().numpy())
+    sim_times = list(times.detach().cpu().numpy()) + list(last + (np.arange(1, n_future + 1) * float(dt)))
+    return simulate_time_evolution(model, x_time, times, sim_times, adjs_list=None, deterministic=deterministic)
+
+
+# --- Longitudinal interpretability helpers: extract latents & time-varying attributions ---
+
+def extract_latent_trajectories(model: torch.nn.Module, x_time: torch.Tensor, times: torch.Tensor, deterministic: bool = True):
+    """Return latent trajectories H_ts (T, N, H) for supported models.
+
+    - NeuralODEVAEGNN: uses encoder -> H0 (mu if deterministic) -> ODEBlock
+    - NeuralODEGNN: uses input projection -> ODEBlock (requires model.set_edge_index called beforehand)
+    Returns H_ts torch.Tensor.
+    """
+    model.eval()
+    if isinstance(model, NeuralODEVAEGNN):
+        mu, logvar = model.encoder(x_time)
+        H0 = mu if deterministic else model.reparameterize(mu, logvar)
+        # build odefunc/adjs similar to forward
+        adjs_list = None
+        odefunc = ODEFunc(model.hidden_dim, edge_index=None, adj=None)
+        odefunc.adj_func = model._make_adj_func(times, adjs_list or [torch.eye(x_time.shape[1]) for _ in range(x_time.shape[0])], PA=model.edge_attention(H0))
+        odeblock = ODEBlock(odefunc)
+        H_ts = odeblock(H0, times)
+        return H_ts
+    elif isinstance(model, NeuralODEGNN):
+        # input proj + use existing odefunc/odeblock (must be set via set_edge_index)
+        if model.odeblock is None:
+            raise RuntimeError('Model ODE block (edge_index/adj) must be set via set_edge_index')
+        h0 = model.input_proj(x_time[0])
+        if model.input_bn is not None:
+            h0 = model.input_bn(h0)
+        if model.dropout is not None and model.training:
+            h0 = model.dropout(h0)
+        H_ts = model.odeblock(h0, times)
+        return H_ts
+    else:
+        raise RuntimeError('Unsupported model for latent extraction')
+
+
+def compute_time_varying_edge_attention(model: torch.nn.Module, x_time: torch.Tensor, times: torch.Tensor, deterministic: bool = True):
+    """Compute PA for each timepoint by applying EdgeAttention to latent H(t).
+
+    Returns: PA_ts as numpy array of shape (T, N, N)
+    """
+    H_ts = extract_latent_trajectories(model, x_time, times, deterministic=deterministic)
+    T, N, H = H_ts.shape
+    pa_list = []
+    attn = None
+    # if model exposes an EdgeAttention instance use it; otherwise construct one
+    if hasattr(model, 'edge_attention') and isinstance(getattr(model, 'edge_attention'), EdgeAttention):
+        attn = model.edge_attention
+    else:
+        attn = EdgeAttention(H)
+    for t in range(T):
+        Ht = H_ts[t]
+        PA = attn(Ht)
+        pa_list.append(PA.detach().cpu().numpy())
+    return np.stack(pa_list, axis=0)
+
+
+def compute_longitudinal_importances(model: torch.nn.Module, subject_item: Dict[str, Any], method: str = 'px'):
+    """Aggregate node and edge importances across sessions for a subject item from `ADNISubjectDataset`.
+
+    Returns a dict with keys:
+      - 'node_scores': (S, N) numpy array
+      - 'edge_scores': (S, N, N) numpy array
+      - 'session_ids': list of session ids corresponding to rows
+    """
+    sessions = subject_item['sessions']
+    S = len(sessions)
+    node_scores = []
+    edge_scores = []
+    session_ids = subject_item.get('session_ids', [sess['session_id'] for sess in sessions])
+    for sess in sessions:
+        x_time = torch.tensor(sess['node_features'], dtype=torch.float32)
+        times = torch.tensor(np.arange(x_time.shape[0]), dtype=torch.float32)
+        ns = node_importance_scores(model, x_time, times, method=method)
+        es = None
+        # try PA-based edge attribution if VAE available
+        if isinstance(model, NeuralODEVAEGNN):
+            try:
+                es = edge_attribution_via_pa(model, x_time, times)
+            except Exception:
+                es = None
+        if es is None:
+            # fall back to time-varying attention computed from latents
+            try:
+                pa_ts = compute_time_varying_edge_attention(model, x_time, times)
+                # simple summary: average absolute PA over time
+                es = np.mean(np.abs(pa_ts), axis=0)
+            except Exception:
+                # final fallback: zero matrix
+                N = x_time.shape[1]
+                es = np.zeros((N, N), dtype=float)
+        node_scores.append(ns)
+        edge_scores.append(es)
+    return {
+        'node_scores': np.stack(node_scores, axis=0),
+        'edge_scores': np.stack(edge_scores, axis=0),
+        'session_ids': session_ids
+    }
+
+
+# --- Visualization helpers (node/edge saliency & subject trajectories) ---
+
+def plot_node_saliency_over_time(saliency: np.ndarray, times: Optional[Union[np.ndarray, List[float]]] = None, roi_names: Optional[List[str]] = None, ax=None, cmap: str = 'viridis', title: Optional[str] = None):
+    """Plot a heatmap of saliency over time and ROIs.
+
+    Args:
+        saliency: (T, N) array of saliency values (time x ROI)
+        times: optional (T,) array for x-axis labels
+        roi_names: optional list of length N for y-axis labels
+        ax: optional matplotlib Axes to draw into
+
+    Returns:
+        (fig, ax)
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:
+        raise RuntimeError('matplotlib is required for plotting (pip install matplotlib)')
+
+    T, N = saliency.shape
+    if times is None:
+        times = np.arange(T)
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 4))
+    else:
+        fig = ax.get_figure()
+
+    im = ax.imshow(saliency.T, aspect='auto', origin='lower', cmap=cmap)
+    ax.set_xlabel('Time')
+    ax.set_xticks(np.arange(T))
+    ax.set_xticklabels([f"{t:.2f}" for t in times], rotation=45)
+    ax.set_ylabel('ROI')
+    if roi_names is not None:
+        ax.set_yticks(np.arange(N))
+        ax.set_yticklabels(roi_names)
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label('Saliency')
+    if title:
+        ax.set_title(title)
+    return fig, ax
+
+
+def plot_edge_attribution(edge_scores: np.ndarray, labels: Optional[List[str]] = None, ax=None, cmap: str = 'coolwarm', title: Optional[str] = 'Edge attribution'):
+    """Plot edge attribution as a heatmap (N x N).
+
+    Returns (fig, ax).
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:
+        raise RuntimeError('matplotlib is required for plotting (pip install matplotlib)')
+
+    if edge_scores.ndim != 2 or edge_scores.shape[0] != edge_scores.shape[1]:
+        raise ValueError('edge_scores must be a square matrix (N,N)')
+    N = edge_scores.shape[0]
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(5, 5))
+    else:
+        fig = ax.get_figure()
+    im = ax.imshow(edge_scores, cmap=cmap, vmin=None, vmax=None)
+    ax.set_xlabel('ROI')
+    ax.set_ylabel('ROI')
+    if labels is not None:
+        ax.set_xticks(np.arange(N)); ax.set_xticklabels(labels, rotation=90)
+        ax.set_yticks(np.arange(N)); ax.set_yticklabels(labels)
+    fig.colorbar(im, ax=ax)
+    if title:
+        ax.set_title(title)
+    return fig, ax
+
+
+def plot_subject_trajectories(sim: dict, times: Optional[Union[np.ndarray, List[float]]] = None, nodes: Optional[List[int]] = None, feature: Optional[int] = None, ax=None, show_legend: bool = True, title: Optional[str] = 'Subject trajectories'):
+    """Plot simulated subject trajectories (X_hat) for selected nodes and a single feature.
+
+    Args:
+        sim: dict returned by `simulate_time_evolution`/`simulate_subject_trajectories` with 'X_hat'
+        times: optional times (length T_sim)
+        nodes: list of node indices to plot (default: first 4 or all if <=4)
+        feature: which feature index to plot (default: mean across features)
+
+    Returns (fig, ax)
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:
+        raise RuntimeError('matplotlib is required for plotting (pip install matplotlib)')
+
+    X_hat = sim.get('X_hat')
+    if X_hat is None:
+        raise ValueError('sim dict must contain X_hat')
+    T_sim, N, F = X_hat.shape
+    if times is None:
+        times = np.arange(T_sim)
+    if nodes is None:
+        nodes = list(range(min(4, N)))
+    if feature is None:
+        # average over features
+        Y = X_hat.mean(axis=-1)
+    else:
+        Y = X_hat[:, :, feature]
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 4))
+    else:
+        fig = ax.get_figure()
+
+    for n in nodes:
+        ax.plot(times, Y[:, n], label=f'ROI {n}')
+    ax.set_xlabel('Time')
+    ax.set_ylabel('Signal')
+    if show_legend:
+        ax.legend()
+    if title:
+        ax.set_title(title)
+    return fig, ax
+
+
+# Training helpers (lightweight)
+
+def train_longitudinal(model: torch.nn.Module, dataloader, optimizer, device='cpu', augment: dict = None):
+    """Single-epoch training with optional augmentation."""
+    model.train()
+    loss_fn = torch.nn.BCEWithLogitsLoss()
+    total = 0.0
+    for batch in dataloader:
+        xs = batch['x']
+        times = batch['times']
+        ys = batch['y'].to(device)
+        optimizer.zero_grad()
+        batch_loss = 0.0
+        for i in range(len(xs)):
+            x_time = xs[i].to(device)
+            t = times[i].to(device)
+            if augment is not None and augment.get('noise_std', 0.0) > 0:
+                x_time = augment_time_series(x_time, noise_std=augment.get('noise_std', 0.01))
+            edge_index = batch['edge_index'][i]
+            adj = batch['adj'][i]
+            if edge_index is not None:
+                model.set_edge_index(edge_index=edge_index.to(device), adj=None)
+            else:
+                model.set_edge_index(edge_index=None, adj=adj.to(device))
+            out = model(x_time, t)
+            loss = loss_fn(out.unsqueeze(0), ys[i].unsqueeze(0))
+            loss.backward()
+            batch_loss += loss.item()
+        optimizer.step()
+        total += batch_loss
+    return total / len(dataloader)
+
+
+
+
+
+def run_kfold_cv(dataset, k: int = 5, random_seed: int = 42, **train_kwargs):
+    """Run k-fold cross validation to assess generalization and reduce overfitting.
+
+    train_kwargs are forwarded to `universal_train_with_early_stopping` (e.g., lr, weight_decay, max_epochs, patience)
+    Returns list of histories and validation scores.
+    """
+    from sklearn.model_selection import KFold
+    kf = KFold(n_splits=k, shuffle=True, random_state=random_seed)
+    idx = np.arange(len(dataset))
+    histories = []
+    val_scores = []
+    for fold, (tr, va) in enumerate(kf.split(idx)):
+        print(f"Fold {fold+1}/{k}")
+        ds_tr = torch.utils.data.Subset(dataset, tr)
+        ds_va = torch.utils.data.Subset(dataset, va)
+        dl_tr = torch.utils.data.DataLoader(ds_tr, batch_size=train_kwargs.get('batch_size', 8), shuffle=True, collate_fn=collate_longitudinal)
+        dl_va = torch.utils.data.DataLoader(ds_va, batch_size=train_kwargs.get('batch_size', 8), shuffle=False, collate_fn=collate_longitudinal)
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        sample = dataset[0]
+        T, N, F = sample['x'].shape
+        model = NeuralODEGNN(in_channels=F, hidden_dim=train_kwargs.get('hidden_dim', 64), num_classes=1, dropout=train_kwargs.get('dropout', 0.0), use_batchnorm=train_kwargs.get('use_batchnorm', False)).to(device)
+        # define batch forward function for longitudinal batches
+        def batch_forward_longitudinal(m, batch, device):
+            xs = batch['x']
+            times = batch['times']
+            ys = batch['y']
+            preds = []
+            targets = []
+            for i in range(len(xs)):
+                x_time = xs[i].to(device)
+                t = times[i].to(device)
+                edge_index = batch['edge_index'][i]
+                adj = batch['adj'][i]
+                if edge_index is not None:
+                    m.set_edge_index(edge_index=edge_index.to(device), adj=None)
+                else:
+                    m.set_edge_index(edge_index=None, adj=adj.to(device))
+                out = m(x_time, t)
+                preds.append(out.unsqueeze(0))
+                targets.append(ys[i].unsqueeze(0).to(device))
+            preds = torch.cat(preds, dim=0)
+            targets = torch.cat(targets, dim=0)
+            return preds, targets
+
+        trained_model, history = universal_train_with_early_stopping(model, dl_tr, dl_va, batch_forward_fn=batch_forward_longitudinal, loss_fn=torch.nn.BCEWithLogitsLoss(), device=device, **train_kwargs)
+        histories.append(history)
+        auc, acc = eval_longitudinal(trained_model, dl_va, device=device)
+        val_scores.append({'auc': auc, 'acc': acc})
+        print(f"Fold {fold+1} val_auc={auc:.4f}, val_acc={acc:.4f}")
+    return histories, val_scores
+
+def eval_longitudinal(model: torch.nn.Module, dataloader, device='cpu'):
+    model.eval()
+    preds = []
+    trues = []
+    with torch.no_grad():
+        for batch in dataloader:
+            xs = batch['x']
+            times = batch['times']
+            ys = batch['y'].numpy().tolist()
+            for i in range(len(xs)):
+                x_time = xs[i].to(device)
+                t = times[i].to(device)
+                edge_index = batch['edge_index'][i]
+                adj = batch['adj'][i]
+                if edge_index is not None:
+                    model.set_edge_index(edge_index=edge_index.to(device), adj=None)
+                else:
+                    model.set_edge_index(edge_index=None, adj=adj.to(device))
+                out = torch.sigmoid(model(x_time, t))
+                preds.append(out.item())
+            trues.extend(ys)
+    from sklearn.metrics import roc_auc_score, accuracy_score
+    auc = roc_auc_score(trues, preds) if len(set(trues)) > 1 else float('nan')
+    acc = accuracy_score([int(p > 0.5) for p in preds], [int(t) for t in trues])
+    return auc, acc
+
+
+# -----------------------------------------------------------------------------
+# Generic batch-based training utilities (work with arbitrary batch formats)
+# -----------------------------------------------------------------------------
+
+def universal_train_epoch(model: torch.nn.Module, dataloader, optimizer, device: str = 'cpu', loss_fn=torch.nn.MSELoss(), batch_forward_fn=None, augment: dict = None):
+    """Train for one epoch using a generic batch forward function.
+
+    - batch_forward_fn(model, batch, device) should return (preds, targets)
+    - dataloader is any iterable of 'batch' objects
+    - loss_fn is a PyTorch loss (e.g., MSELoss, BCEWithLogitsLoss)
+    """
+    model.train()
+    total_loss = 0.0
+    n_batches = 0
+    for batch in dataloader:
+        if augment is not None and isinstance(augment, dict) and augment.get('noise_std', 0.0) > 0:
+            # caller is responsible for applying augmentation inside batch_forward_fn if needed
+            pass
+        optimizer.zero_grad()
+        preds, targets = batch_forward_fn(model, batch, device)
+        loss = loss_fn(preds, targets)
+        loss.backward()
+        optimizer.step()
+        total_loss += float(loss.detach().cpu().item())
+        n_batches += 1
+    return total_loss / max(1, n_batches)
+
+
+def universal_eval(model: torch.nn.Module, dataloader, device: str = 'cpu', batch_forward_fn=None):
+    """Evaluate model over dataloader using batch_forward_fn; returns dict with preds and trues and computed metrics when possible."""
+    model.eval()
+    preds_all = []
+    trues_all = []
+    with torch.no_grad():
+        for batch in dataloader:
+            preds, targets = batch_forward_fn(model, batch, device)
+            # allow preds/targets to be tensors or numpy
+            preds_np = preds.detach().cpu().numpy() if isinstance(preds, torch.Tensor) else np.array(preds)
+            targets_np = targets.detach().cpu().numpy() if isinstance(targets, torch.Tensor) else np.array(targets)
+            # flatten
+            preds_all.extend(np.asarray(preds_np).ravel().tolist())
+            trues_all.extend(np.asarray(targets_np).ravel().tolist())
+    res = {'preds': np.array(preds_all), 'trues': np.array(trues_all)}
+    # try to compute sensible metrics
+    try:
+        from sklearn.metrics import roc_auc_score, accuracy_score, mean_squared_error
+        # classification
+        if set(np.unique(res['trues'])) <= {0, 1}:
+            if len(set(res['trues'])) > 1:
+                res['auc'] = roc_auc_score(res['trues'], res['preds'])
+            else:
+                res['auc'] = float('nan')
+            res['acc'] = accuracy_score((res['preds'] > 0.5).astype(int), res['trues'].astype(int))
+        else:
+            # regression
+            res['mse'] = mean_squared_error(res['trues'], res['preds'])
+    except Exception:
+        pass
+    return res
+
+
+def universal_train_with_early_stopping(model: torch.nn.Module, dl_train, dl_val, batch_forward_fn, loss_fn=torch.nn.MSELoss(), device: str = 'cpu', lr: float = 1e-3, weight_decay: float = 1e-4, max_epochs: int = 100, patience: int = 10, monitor: str = 'auc', augment: dict = None):
+    """Generic training loop with early stopping and LR scheduling.
+
+    - monitor: 'auc' or 'val_loss' (for regression)
+    - batch_forward_fn: function(model, batch, device) -> (preds, targets)
+    - dl_train/dl_val: iterables of batches
+    """
+    import copy
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    # choose scheduler mode
+    mode = 'max' if monitor == 'auc' else 'min'
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode=mode, factor=0.5, patience=max(1, patience // 3), verbose=True)
+
+    best_metric = -float('inf') if mode == 'max' else float('inf')
+    best_state = None
+    no_improve = 0
+    history = {'train_loss': [], 'val_metric': []}
+
+    for epoch in range(max_epochs):
+        train_loss = universal_train_epoch(model, dl_train, optimizer, device=device, loss_fn=loss_fn, batch_forward_fn=batch_forward_fn, augment=augment)
+        val_res = universal_eval(model, dl_val, device=device, batch_forward_fn=batch_forward_fn)
+
+        if monitor == 'auc':
+            metric = val_res.get('auc', float('nan'))
+        else:
+            metric = val_res.get('mse', val_res.get('val_loss', float('nan')))
+
+        history['train_loss'].append(train_loss)
+        history['val_metric'].append(metric)
+
+        # scheduler step
+        if not np.isnan(metric):
+            scheduler.step(metric)
+
+        improved = False
+        if (mode == 'max' and metric > best_metric + 1e-6) or (mode == 'min' and metric < best_metric - 1e-6):
+            best_metric = metric
+            best_state = copy.deepcopy(model.state_dict())
+            no_improve = 0
+            improved = True
+        else:
+            no_improve += 1
+
+        print(f"Epoch {epoch}: train_loss={train_loss:.4f}, val_metric={metric}")
+
+        if no_improve >= patience:
+            print(f"Early stopping after {epoch+1} epochs (no improvement for {patience} epochs)")
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model, history
+
+# Extend CLI to include longitudinal training/demo
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='GNN ADNI utilities')
+    parser.add_argument('--preview-manifest', type=str, help='Path to ADNI manifest CSV to preview')
+    parser.add_argument('--adni-root', type=str, default=None, help='Root dir for timeseries files')
+    parser.add_argument('--n', type=int, default=5, help='Number of samples to preview')
+    parser.add_argument('--run-validation', action='store_true', help='Run full internal validation and demo')
+    parser.add_argument('--train-longitudinal', action='store_true', help='Train Neural ODE longitudinal GNN')
+    parser.add_argument('--data-dir', type=str, help='Directory of per-subject folders for longitudinal training')
+    parser.add_argument('--epochs', type=int, default=20)
+    parser.add_argument('--batch-size', type=int, default=8)
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--demo-longitudinal', action='store_true', help='Run a short randomized demo training for the longitudinal model')
+    args = parser.parse_args()
+
+    if args.preview_manifest:
+        _cli_preview(args.preview_manifest, adni_root=args.adni_root, n=args.n)
+        sys.exit(0)
+
+    # If user requested validation or no args provided, run internal checks + demo
+    if args.run_validation or (not any([args.train_longitudinal, args.demo_longitudinal]) and len(sys.argv) == 1):
+        print('='*80)
+        print('Dynamic Disease Graph (DDG) - Research-Grade Pipeline')
+        print('='*80)
+        print()
+
+        # Run validation
+        validation_ok = comprehensive_validation()
+
+        if validation_ok:
+            print('\nRunning demo...\n')
+            model, losses = quick_demo(train_epochs=10, use_gde=False, batch_size=16)
+        else:
+            print('\nValidation failed. Skipping demo.')
+
+    if args.demo_longitudinal:
+        # create tiny synthetic per-subject folders and run training for a few epochs
+        import tempfile
+        import shutil
+        print('Creating tiny synthetic longitudinal dataset...')
+        with tempfile.TemporaryDirectory() as tmp:
+            # create 10 subjects
+            for i in range(10):
+                sub = f"sub_{i:03d}"
+                d = os.path.join(tmp, sub)
+                os.makedirs(d, exist_ok=True)
+                T = 3
+                N = 12
+                F = 6
+                times = np.linspace(0.0, 2.0, T)
+                x = np.random.randn(T, N, F).astype(np.float32)
+                # ring edges
+                edges = np.array([[j for j in range(N)], [(j+1)%N for j in range(N)]], dtype=np.int64)
+                label = np.array([float(i%2)], dtype=np.float32)
+                np.save(os.path.join(d, 'times.npy'), times)
+                np.save(os.path.join(d, 'node_features.npy'), x)
+                np.save(os.path.join(d, 'edge_index.npy'), edges)
+                np.save(os.path.join(d, 'label.npy'), label)
+            ds = ADNILongitudinalDataset(tmp)
+            ds_train = torch.utils.data.Subset(ds, list(range(8)))
+            ds_val = torch.utils.data.Subset(ds, list(range(8, 10)))
+            dl_train = torch.utils.data.DataLoader(ds_train, batch_size=args.batch_size, shuffle=True, collate_fn=collate_longitudinal)
+            dl_val = torch.utils.data.DataLoader(ds_val, batch_size=args.batch_size, shuffle=False, collate_fn=collate_longitudinal)
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            sample = ds[0]
+            T, N, F = sample['x'].shape
+            model = NeuralODEGNN(in_channels=F, hidden_dim=32, num_classes=1).to(device)
+            opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+            print('Training demo model...')
+            for ep in range(3):
+                loss = train_longitudinal(model, dl_train, opt, device=device)
+                auc, acc = eval_longitudinal(model, dl_val, device=device)
+                print(f'Epoch {ep}: loss={loss:.4f}, val_auc={auc:.4f}, val_acc={acc:.4f}')
+        print('Demo finished.')
+
+    if args.train_longitudinal:
+        if not args.data_dir:
+            raise ValueError('--data-dir is required for --train-longitudinal')
+        ds = ADNILongitudinalDataset(args.data_dir)
+        n = len(ds)
+        train_idx = list(range(int(0.8*n)))
+        val_idx = list(range(int(0.8*n), n))
+        dl_train = torch.utils.data.DataLoader(torch.utils.data.Subset(ds, train_idx), batch_size=args.batch_size, shuffle=True, collate_fn=collate_longitudinal)
+        dl_val = torch.utils.data.DataLoader(torch.utils.data.Subset(ds, val_idx), batch_size=args.batch_size, shuffle=False, collate_fn=collate_longitudinal)
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        sample = ds[0]
+        T, N, F = sample['x'].shape
+        model = NeuralODEGNN(in_channels=F, hidden_dim=64, num_classes=1).to(device)
+        opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+        best_auc = 0.0
+        for ep in range(args.epochs):
+            loss = train_longitudinal(model, dl_train, opt, device=device)
+            auc, acc = eval_longitudinal(model, dl_val, device=device)
+            print(f'Epoch {ep}: loss={loss:.4f}, val_auc={auc:.4f}, val_acc={acc:.4f}')
+            if not np.isnan(auc) and auc > best_auc:
+                best_auc = auc
+                torch.save(model.state_dict(), 'best_longitudinal_ode_gnn.pt')
