@@ -17,8 +17,8 @@ https://docs.google.com/document/d/1cy0_JPhTfHO2ONlpRYeG0yKOuKpWstInn_SPx_0A3I0/
 
 ---
 
-## To run this file, install a Python virtual environment + requirements.txt. 
-## Then type:
+### To run this file, install a Python virtual environment + requirements.txt. 
+### Then type:
 `python run_gnn_on_synthetic.py`.
 
 ---
